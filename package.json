@@ -1,0 +1,20 @@
+{
+  "name": "ath-drawdown-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ATH Drawdown indicator + Telegram alerting bot (Jupiter datapi, grammY)",
+  "scripts": {
+    "start": "bun run src/alerts/index.ts",
+    "typecheck": "tsc --noEmit",
+    "selfcheck": "bun run src/utils/selfcheck.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
