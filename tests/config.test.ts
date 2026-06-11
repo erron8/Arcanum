@@ -160,4 +160,72 @@ describe('buildConfig', () => {
     );
     expect(buildConfig({ TELEGRAM_CHAT_ID: 'bad' }).telegramChatId).toBeUndefined();
   });
+
+  test('GMGN scanner is disabled by default with sane defaults', () => {
+    const g = buildConfig({}).gmgn;
+    expect(g.enabled).toBe(false);
+    expect(g.autoWatch).toBe(false);
+    expect(g.apiKey).toBe('');
+    expect(g.scanIntervalMs).toBe(300_000);
+    expect(g.totalFeeMinSol).toBe(30);
+    expect(g.marketCapMinUsd).toBe(250_000);
+    expect(g.drawdownMinPct).toBe(50);
+    expect(g.minTokenAgeHours).toBe(4);
+    expect(g.maxTokenAgeDays).toBe(14);
+    expect(g.scanLimit).toBe(100);
+    expect(g.scanConcurrency).toBe(4);
+    expect(g.dedupeMs).toBe(86_400_000);
+    expect(g.baseUrl).toBe('https://openapi.gmgn.ai');
+  });
+
+  test('GMGN flags parse from env', () => {
+    const g = buildConfig({ GMGN_SCAN_ENABLED: 'true', GMGN_AUTO_WATCH: 'true', GMGN_API_KEY: ' k ' }).gmgn;
+    expect(g.enabled).toBe(true);
+    expect(g.autoWatch).toBe(true);
+    expect(g.apiKey).toBe('k'); // trimmed
+  });
+});
+
+describe('validateEnv GMGN', () => {
+  test('unset GMGN section is valid (defaults pass)', () => {
+    expect(ok()).toEqual([]);
+  });
+
+  test('GMGN_API_KEY is required only when the scanner is enabled', () => {
+    expect(ok({ GMGN_SCAN_ENABLED: 'true' }).some((e) => e.includes('GMGN_API_KEY'))).toBe(true);
+    expect(ok({ GMGN_SCAN_ENABLED: 'true', GMGN_API_KEY: 'secret' })).toEqual([]);
+    // Disabled scanner needs no key.
+    expect(ok({ GMGN_SCAN_ENABLED: 'false' })).toEqual([]);
+  });
+
+  test('scan interval must be >= 60000', () => {
+    expect(ok({ GMGN_SCAN_INTERVAL_MS: '1000' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_SCAN_INTERVAL_MS: '60000' })).toEqual([]);
+  });
+
+  test('concurrency must be in [1, 32]', () => {
+    expect(ok({ GMGN_SCAN_CONCURRENCY: '0' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_SCAN_CONCURRENCY: '64' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_SCAN_CONCURRENCY: '8' })).toEqual([]);
+  });
+
+  test('scan limit must be in [1, 100]', () => {
+    expect(ok({ GMGN_SCAN_LIMIT: '0' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_SCAN_LIMIT: '101' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_SCAN_LIMIT: '50' })).toEqual([]);
+  });
+
+  test('drawdown must be in [0, 100] and numerics finite', () => {
+    expect(ok({ GMGN_DRAWDOWN_MIN_PCT: '150' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_TOTAL_FEE_MIN_SOL: 'abc' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_MARKET_CAP_MIN_USD: '-1' }).length).toBeGreaterThan(0);
+  });
+
+  test('min age must be below max age', () => {
+    expect(
+      ok({ GMGN_MIN_TOKEN_AGE_HOURS: '400', GMGN_MAX_TOKEN_AGE_DAYS: '14' }).some((e) =>
+        e.includes('less than'),
+      ),
+    ).toBe(true);
+  });
 });

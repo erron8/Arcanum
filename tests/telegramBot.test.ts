@@ -257,6 +257,38 @@ describe('TelegramTransport delivery (confirmed)', () => {
   });
 });
 
+describe('TelegramTransport.notify (generic notification path)', () => {
+  test('delivers messages to authorized subscribers and reports success', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [1, 2] }, [1, 2]);
+    await bot.init();
+    const sent = recorder(bot);
+    const ok = await bot.notify(['hello *world*']);
+    expect(ok).toBe(true);
+    expect(sent.filter((m) => m.text === 'hello *world*').map((m) => m.chatId).sort()).toEqual([
+      1, 2,
+    ]);
+  });
+
+  test('reports false when there are no subscribers (will retry)', async () => {
+    const { bot } = await makeTransport({}, []);
+    await bot.init();
+    expect(await bot.notify(['x'])).toBe(false);
+  });
+
+  test('a 5xx is not counted as delivered', async () => {
+    const { bot } = await makeTransport({}, [42]);
+    await bot.init();
+    bot.useApiInterceptor(() => apiErr(500));
+    expect(await bot.notify(['x'])).toBe(false);
+  });
+
+  test('empty message list is a no-op', async () => {
+    const { bot } = await makeTransport({}, [42]);
+    await bot.init();
+    expect(await bot.notify([])).toBe(false);
+  });
+});
+
 describe('TelegramTransport commands (real handler path)', () => {
   test('/watch verifies, persists, and confirms', async () => {
     const { bot, store } = await makeTransport(

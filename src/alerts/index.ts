@@ -2,6 +2,9 @@ import { buildConfig, validateEnv } from './config';
 import { AlertStore } from './store';
 import { AthMonitor } from './athMonitor';
 import { TelegramTransport } from './telegramBot';
+import { GmgnClient } from '../gmgn/client';
+import { GmgnScreenedStore } from '../gmgn/store';
+import { GmgnScanner } from '../gmgn/scanner';
 
 /** Best-effort .env loading: use dotenv if installed, otherwise rely on process.env. */
 async function loadEnv(): Promise<void> {
@@ -46,12 +49,39 @@ async function main(): Promise<void> {
   // Wire monitor → telegram (settable sink resolves the circular dependency).
   monitor.setSink(bot.buildSink());
 
+  // Optional GMGN drawdown scanner — disabled by default; never affects /watch.
+  let gmgnScanner: GmgnScanner | null = null;
+  if (config.gmgn.enabled) {
+    const client = new GmgnClient({
+      baseUrl: config.gmgn.baseUrl,
+      apiKey: config.gmgn.apiKey,
+      attempts: config.gmgn.attempts,
+      backoffMs: config.gmgn.backoffMs,
+      timeoutMs: config.gmgn.timeoutMs,
+    });
+    const screenedStore = new GmgnScreenedStore(config.gmgn.screenedPath);
+    await screenedStore.init();
+    gmgnScanner = new GmgnScanner(config.gmgn, {
+      client,
+      store: screenedStore,
+      notify: (messages) => bot.notify(messages),
+      watchStore: config.gmgn.autoWatch ? store : undefined,
+    });
+  }
+
   let shuttingDown = false;
   const shutdown = async (signal: string, code = 0): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`\n[index] ${signal} received — shutting down…`);
     monitor.stop();
+    // Await the scanner so an in-flight cycle finishes (and won't notify) before
+    // we stop Telegram below.
+    try {
+      await gmgnScanner?.stop();
+    } catch (err) {
+      console.error('[index] error stopping GMGN scanner:', err);
+    }
     try {
       await bot.stop();
     } catch (err) {
@@ -75,6 +105,16 @@ async function main(): Promise<void> {
     void shutdown('TELEGRAM-POLL', 1);
   });
   monitor.start();
+
+  // Start the GMGN scanner only after Telegram is live so its alerts have a delivery path.
+  if (gmgnScanner) {
+    gmgnScanner.start();
+    console.log(
+      `[index] GMGN scanner enabled · scanInterval=${config.gmgn.scanIntervalMs}ms · ` +
+        `feeMin=${config.gmgn.totalFeeMinSol} SOL · mcapMin=$${config.gmgn.marketCapMinUsd} · ` +
+        `drawdownMin=${config.gmgn.drawdownMinPct}% · autoWatch=${config.gmgn.autoWatch}`,
+    );
+  }
 
   console.log(
     `[index] running · poll=${config.pollIntervalMs}ms · interval=${config.interval} · ` +

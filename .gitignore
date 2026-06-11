@@ -1,9 +1,13 @@
 node_modules/
 data/*.json
 data/*.json.tmp
+# Ignore every .env variant (.env, .env.bak, .env.local, …) but keep the template.
 .env
+.env.*
+!.env.example
 *.log
 .DS_Store
+ath-drawdown-plan.md
 dist/
 coverage/
 .bun/

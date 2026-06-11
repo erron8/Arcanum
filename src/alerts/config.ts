@@ -16,6 +16,13 @@ function rawStr(env: Env, name: string, def: string): string {
   return v === undefined || v.trim() === '' ? def : v;
 }
 
+/** Parse a boolean env flag. Only the literal string 'true' enables it. */
+function rawBool(env: Env, name: string, def: boolean): boolean {
+  const v = env[name];
+  if (v === undefined || v.trim() === '') return def;
+  return v.trim().toLowerCase() === 'true';
+}
+
 /**
  * ATH_WINDOW controls how many candles define the lookback window.
  *   'all'  → request ATH_MAX_CANDLES candles.
@@ -25,6 +32,37 @@ function resolveCandles(window: string, max: number): number {
   if (window.toLowerCase() === 'all') return max;
   const n = Number(window);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : max;
+}
+
+/** Default GMGN OpenAPI base URL; overridable via GMGN_BASE_URL (mainly for tests). */
+export const GMGN_DEFAULT_BASE_URL = 'https://openapi.gmgn.ai';
+
+/** Hard cap on scan concurrency so a misconfigured value can't hammer the API. */
+export const GMGN_MAX_CONCURRENCY = 32;
+
+/**
+ * Configuration for the optional GMGN drawdown scanner. The scanner is disabled
+ * by default and never affects the existing /watch flow.
+ */
+export interface GmgnConfig {
+  enabled: boolean;
+  apiKey: string; // empty when disabled; required (validated) when enabled
+  baseUrl: string;
+  scanIntervalMs: number;
+  totalFeeMinSol: number;
+  marketCapMinUsd: number;
+  drawdownMinPct: number;
+  minTokenAgeHours: number;
+  maxTokenAgeDays: number;
+  scanLimit: number;
+  scanConcurrency: number;
+  dedupeMs: number;
+  autoWatch: boolean;
+  screenedPath: string;
+  // request resilience (shared defaults with the Jupiter fetch tunables)
+  attempts: number;
+  backoffMs: number;
+  timeoutMs: number;
 }
 
 export interface AppConfig {
@@ -50,6 +88,31 @@ export interface AppConfig {
   webhookUrl: string | undefined;
   webhookPort: number;
   webhookSecret: string | undefined;
+  gmgn: GmgnConfig;
+}
+
+/** Build the GMGN sub-config from the environment (pure; defaults for blanks). */
+function buildGmgnConfig(env: Env): GmgnConfig {
+  return {
+    enabled: rawBool(env, 'GMGN_SCAN_ENABLED', false),
+    apiKey: rawStr(env, 'GMGN_API_KEY', '').trim(),
+    baseUrl: rawStr(env, 'GMGN_BASE_URL', GMGN_DEFAULT_BASE_URL).replace(/\/+$/, ''),
+    scanIntervalMs: rawNum(env, 'GMGN_SCAN_INTERVAL_MS', 300_000),
+    totalFeeMinSol: rawNum(env, 'GMGN_TOTAL_FEE_MIN_SOL', 30),
+    marketCapMinUsd: rawNum(env, 'GMGN_MARKET_CAP_MIN_USD', 250_000),
+    drawdownMinPct: rawNum(env, 'GMGN_DRAWDOWN_MIN_PCT', 50),
+    minTokenAgeHours: rawNum(env, 'GMGN_MIN_TOKEN_AGE_HOURS', 4),
+    maxTokenAgeDays: rawNum(env, 'GMGN_MAX_TOKEN_AGE_DAYS', 14),
+    scanLimit: rawNum(env, 'GMGN_SCAN_LIMIT', 100),
+    scanConcurrency: rawNum(env, 'GMGN_SCAN_CONCURRENCY', 4),
+    dedupeMs: rawNum(env, 'GMGN_DEDUPE_MS', 86_400_000),
+    autoWatch: rawBool(env, 'GMGN_AUTO_WATCH', false),
+    screenedPath: rawStr(env, 'GMGN_SCREENED_PATH', './data/gmgn-screened.json'),
+    // Reuse the Jupiter fetch tunables as sensible defaults for the GMGN client.
+    attempts: rawNum(env, 'FETCH_ATTEMPTS', 3),
+    backoffMs: rawNum(env, 'FETCH_BACKOFF_MS', 500),
+    timeoutMs: rawNum(env, 'FETCH_TIMEOUT_MS', 8_000),
+  };
 }
 
 /** Build a config snapshot from an environment map (pure; defaults for blanks). */
@@ -88,6 +151,7 @@ export function buildConfig(env: Env): AppConfig {
     webhookUrl: env.WEBHOOK_URL?.trim() || undefined,
     webhookPort: rawNum(env, 'WEBHOOK_PORT', 8080),
     webhookSecret: env.WEBHOOK_SECRET_TOKEN?.trim() || undefined,
+    gmgn: buildGmgnConfig(env),
   };
 }
 
@@ -231,5 +295,69 @@ export function validateEnv(env: Env): string[] {
     }
   }
 
+  validateGmgnEnv(env, errors, { requirePositive, requireRange, requireInt });
+
   return errors;
+}
+
+/**
+ * Validate the GMGN scanner configuration. Numeric tunables are always range-checked
+ * (their defaults are valid, so an unset GMGN section never produces errors). The API
+ * key is required only when GMGN_SCAN_ENABLED=true, so disabling the scanner needs no key.
+ */
+function validateGmgnEnv(
+  env: Env,
+  errors: string[],
+  v: {
+    requirePositive: (name: string, def: number, min: number) => number;
+    requireRange: (name: string, def: number, lo: number, hi: number) => number;
+    requireInt: (name: string, def: number, min: number) => number;
+  },
+): void {
+  const enabled = rawBool(env, 'GMGN_SCAN_ENABLED', false);
+
+  if (enabled) {
+    const key = env.GMGN_API_KEY;
+    if (key === undefined || key.trim() === '') {
+      errors.push('GMGN_API_KEY is required when GMGN_SCAN_ENABLED=true.');
+    }
+  }
+
+  // Scan interval must never tick faster than once a minute, regardless of enablement.
+  v.requirePositive('GMGN_SCAN_INTERVAL_MS', 300_000, 60_000);
+  v.requirePositive('GMGN_TOTAL_FEE_MIN_SOL', 30, 0);
+  v.requirePositive('GMGN_MARKET_CAP_MIN_USD', 250_000, 0);
+  v.requireRange('GMGN_DRAWDOWN_MIN_PCT', 50, 0, 100);
+  v.requirePositive('GMGN_MIN_TOKEN_AGE_HOURS', 4, 0);
+  v.requirePositive('GMGN_MAX_TOKEN_AGE_DAYS', 14, 0);
+  v.requireInt('GMGN_DEDUPE_MS', 86_400_000, 0);
+
+  // rank endpoint returns at most 100 rows.
+  const limit = v.requireInt('GMGN_SCAN_LIMIT', 100, 1);
+  if (Number.isFinite(limit) && limit > 100) {
+    errors.push(`GMGN_SCAN_LIMIT must be in [1, 100] (got '${env.GMGN_SCAN_LIMIT}').`);
+  }
+
+  const concurrency = v.requireInt('GMGN_SCAN_CONCURRENCY', 4, 1);
+  if (Number.isFinite(concurrency) && concurrency > GMGN_MAX_CONCURRENCY) {
+    errors.push(
+      `GMGN_SCAN_CONCURRENCY must be in [1, ${GMGN_MAX_CONCURRENCY}] (got '${env.GMGN_SCAN_CONCURRENCY}').`,
+    );
+  }
+
+  // The min/max age window must be coherent (min strictly below max).
+  const minH = env.GMGN_MIN_TOKEN_AGE_HOURS;
+  const maxD = env.GMGN_MAX_TOKEN_AGE_DAYS;
+  const minHours = minH === undefined || minH.trim() === '' ? 4 : Number(minH);
+  const maxDays = maxD === undefined || maxD.trim() === '' ? 14 : Number(maxD);
+  if (
+    Number.isFinite(minHours) &&
+    Number.isFinite(maxDays) &&
+    minHours / 24 >= maxDays
+  ) {
+    errors.push(
+      `GMGN_MIN_TOKEN_AGE_HOURS (${minHours}h) must be less than ` +
+        `GMGN_MAX_TOKEN_AGE_DAYS (${maxDays}d).`,
+    );
+  }
 }

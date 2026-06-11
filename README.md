@@ -24,8 +24,14 @@ src/
     config.ts            # env-overridable tunables
     store.ts             # atomic, debounced JSON persistence
     athMonitor.ts        # poll loop + ARMED/TRIGGERED state machine (transport-agnostic)
-    telegramBot.ts       # grammY transport + commands
+    telegramBot.ts       # grammY transport + commands + generic notify()
     index.ts             # bootstrap + graceful shutdown
+  gmgn/                  # optional GMGN drawdown scanner (disabled by default)
+    client.ts            # GMGN OpenAPI client (auth, retries; injectable fetch)
+    types.ts             # GMGN response types
+    scanner.ts           # base filter + screening workflow + cron loop
+    format.ts            # MarkdownV2 screening-alert rendering
+    store.ts             # dedupe store (./data/gmgn-screened.json)
 ```
 
 ## Setup
@@ -116,6 +122,19 @@ Mints must be base58, 32–44 chars; malformed mints are rejected with a clear r
 | `SEND_INTERVAL_MS` | 60 | Delay between Telegram alert messages. |
 | `STORE_PATH` | ./data/alerts.json | Watch store path (must differ from subscribers). |
 | `SUBSCRIBERS_PATH` | ./data/subscribers.json | Subscriber list path (must differ from store). |
+| `GMGN_SCAN_ENABLED` | false | Enable the GMGN drawdown scanner. |
+| `GMGN_API_KEY` | — | **Required when enabled.** GMGN OpenAPI key. Never commit it. |
+| `GMGN_SCAN_INTERVAL_MS` | 300000 | Scan cadence (≥ 60000). |
+| `GMGN_TOTAL_FEE_MIN_SOL` | 30 | Min total trading fees (SOL). |
+| `GMGN_MARKET_CAP_MIN_USD` | 250000 | Min market cap (USD). |
+| `GMGN_DRAWDOWN_MIN_PCT` | 50 | Min % down from ATH ([0, 100]). |
+| `GMGN_MIN_TOKEN_AGE_HOURS` | 4 | Min token age (must be < max). |
+| `GMGN_MAX_TOKEN_AGE_DAYS` | 14 | Max token age. |
+| `GMGN_SCAN_LIMIT` | 100 | Trending rows per scan ([1, 100]). |
+| `GMGN_SCAN_CONCURRENCY` | 4 | Parallel token screenings ([1, 32]). |
+| `GMGN_DEDUPE_MS` | 86400000 | Don't re-alert a mint within this window. |
+| `GMGN_AUTO_WATCH` | false | Also add passing mints to `/watch` at threshold 50. |
+| `GMGN_SCREENED_PATH` | ./data/gmgn-screened.json | Dedupe store path (gitignored). |
 
 > Prices are **SOL-denominated** by default (`quote=native`). Set `QUOTE=usd` for USD.
 > Jupiter `time` is in seconds (converted to ms internally). Invalid env values
@@ -134,6 +153,60 @@ Mints must be base58, 32–44 chars; malformed mints are rejected with a clear r
   can still re-arm at full recovery instead of getting stuck forever.
 
 `persistedAth` only moves up automatically; it is lowered only by `/resetath`.
+
+## GMGN drawdown scanner (optional, disabled by default)
+
+An optional in-process cron that finds Solana coins that are **deep in drawdown but
+still alive**, screens them, and sends Telegram **screening alerts** to your existing
+subscribers. It is **disabled by default** and never touches the `/watch` flow.
+
+Enable it with:
+
+```env
+GMGN_SCAN_ENABLED=true
+GMGN_API_KEY=your-gmgn-openapi-key   # REQUIRED when enabled; never commit it
+```
+
+Every 5 minutes (`GMGN_SCAN_INTERVAL_MS`, runs once immediately on startup) the
+scanner:
+
+1. **Candidate source** — pulls trending tokens from `GET /v1/market/rank`
+   (`chain=sol, interval=5m, order_by=volume`, filters `renounced/frozen/not_wash_trading`),
+   then applies a cheap client-side quick filter (market cap, wash-trading, bundler
+   rate, smart-money presence).
+2. **Base filter** (`GET /v1/token/info`) — keeps a token only if **all** hold:
+   `total_fee ≥ GMGN_TOTAL_FEE_MIN_SOL`, market cap ≥ `GMGN_MARKET_CAP_MIN_USD`
+   (uses `market_cap`, else `price × circulating_supply`), token age within
+   `[GMGN_MIN_TOKEN_AGE_HOURS, GMGN_MAX_TOKEN_AGE_DAYS]`, and drawdown from ATH
+   ≥ `GMGN_DRAWDOWN_MIN_PCT`. Drawdown uses `ath_price`; when that field is missing
+   it falls back to the ATH computed over the token's **full lifetime** kline
+   (hourly candles from launch), and fails closed if no ATH can be established.
+3. **Screening workflow** — security audit
+   (`/v1/token/security`), holders/traders smart-money + KOL extraction
+   (`token_top_holders` / `token_top_traders`), and 5m-kline volume-authenticity
+   checks cross-referenced with wash/bundler/rat/bot stats. Hard-fail conditions
+   (mint/freeze not renounced **or renounce status unknown**, wash trading, `rug_ratio > 0.30`,
+   `top_10_holder_rate > 0.50`, `creator_hold`, `sniper_count > 20`,
+   `bundler_trader_amount_rate > 0.40`) yield a **FAIL** verdict and are **blocked**;
+   mid-band values become **WARN**; clean tokens are **PASS**.
+4. **Alert** — `PASS`/`WARN` candidates are sent as compact MarkdownV2 messages
+   (symbol, mint, price, market cap, fees, age, ATH, drawdown %, verdict, key
+   warnings, smart-money/KOL summary, GMGN/Jupiter/Birdeye links) via the same
+   authorized-subscriber + retry path as drawdown alerts (`bot.notify`). Each mint is
+   recorded in `./data/gmgn-screened.json` so it isn't re-alerted within
+   `GMGN_DEDUPE_MS` (default 24h). Delivery is recorded only after a subscriber
+   actually receives it, so an undelivered batch retries next cycle.
+
+Safety & robustness:
+
+- **No hardcoded secrets** — the API key is read only from `GMGN_API_KEY`; startup
+  **fails** if `GMGN_SCAN_ENABLED=true` without a key. The key is never logged or put
+  in a URL (auth is the `X-APIKEY` header; each request adds a fresh `timestamp` and
+  random `client_id`).
+- **Resilient** — 429/5xx/network failures are retried with backoff; one token's
+  failure never aborts the scan cycle; overlapping cycles are skipped and logged.
+- **Optional auto-watch** — with `GMGN_AUTO_WATCH=true`, passing mints are also added
+  to the `/watch` store at threshold 50 (default **false**).
 
 ## Delivery & lifecycle
 
@@ -185,8 +258,9 @@ git status --short
 
 Before committing, confirm:
 
-- `.env` is not staged. It contains the real `TELEGRAM_BOT_TOKEN`.
-- `data/*.json` is not staged. Those files contain local subscriber/watch state.
+- `.env` is not staged. It contains the real `TELEGRAM_BOT_TOKEN` (and, if you use the
+  scanner, your real `GMGN_API_KEY`). **Never commit real API keys.**
+- `data/*.json` is not staged. Those files contain local subscriber/watch/screening state.
 - `node_modules/`, logs, build output, and coverage output are not staged.
 - The verification commands above pass.
 

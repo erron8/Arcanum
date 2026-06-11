@@ -241,32 +241,55 @@ export class TelegramTransport {
   buildSink(): AlertSink {
     return async (alerts: AlertPayload[]): Promise<string[]> => {
       if (alerts.length === 0) return [];
-      const recipients = this.authorizedSubscribers();
-      if (recipients.length === 0) {
-        console.warn('[telegram] alert fired but no subscribers; will retry next cycle.');
-        return [];
-      }
       const messages = formatAlertMessages(alerts, this.cfg.quote);
-      let anyDelivered = false;
-      for (let i = 0; i < recipients.length; i++) {
-        const chatId = recipients[i]!;
-        // Re-check membership: a user who /stop'd mid-delivery must not receive it.
-        if (!this.subscribers.has(chatId) || !isChatAuthorized(this.cfg.allowedChatIds, chatId)) {
-          continue;
-        }
-        let chatOk = true;
-        for (const text of messages) {
-          if (!(await this.sendWithRetry(chatId, text))) {
-            chatOk = false;
-            break;
-          }
-          if (this.cfg.sendIntervalMs > 0) await delay(this.cfg.sendIntervalMs);
-        }
-        if (chatOk) anyDelivered = true;
-      }
+      const anyDelivered = await this.broadcast(messages);
       // Consumed only if at least one subscriber actually received the batch.
       return anyDelivered ? alerts.map((a) => a.mint) : [];
     };
+  }
+
+  /**
+   * Generic public notification path. Sends pre-rendered MarkdownV2 messages to all
+   * authorized subscribers, reusing the same authorization + retry behavior as
+   * {@link buildSink}. Returns true iff at least one subscriber received the batch.
+   * Used by out-of-band producers (e.g. the GMGN scanner) so Telegram sending logic
+   * is never duplicated.
+   */
+  async notify(messages: string[]): Promise<boolean> {
+    if (messages.length === 0) return false;
+    return this.broadcast(messages);
+  }
+
+  /**
+   * Deliver a batch of MarkdownV2 messages to every currently-authorized subscriber.
+   * Membership/authorization is re-checked before each send so a chat that /stop'd
+   * mid-delivery is skipped. Returns true if ≥ 1 subscriber received the whole batch.
+   */
+  private async broadcast(messages: string[]): Promise<boolean> {
+    if (messages.length === 0) return false;
+    const recipients = this.authorizedSubscribers();
+    if (recipients.length === 0) {
+      console.warn('[telegram] notification fired but no subscribers; will retry next cycle.');
+      return false;
+    }
+    let anyDelivered = false;
+    for (let i = 0; i < recipients.length; i++) {
+      const chatId = recipients[i]!;
+      // Re-check membership: a user who /stop'd mid-delivery must not receive it.
+      if (!this.subscribers.has(chatId) || !isChatAuthorized(this.cfg.allowedChatIds, chatId)) {
+        continue;
+      }
+      let chatOk = true;
+      for (const text of messages) {
+        if (!(await this.sendWithRetry(chatId, text))) {
+          chatOk = false;
+          break;
+        }
+        if (this.cfg.sendIntervalMs > 0) await delay(this.cfg.sendIntervalMs);
+      }
+      if (chatOk) anyDelivered = true;
+    }
+    return anyDelivered;
   }
 
   private authorizedSubscribers(): number[] {
