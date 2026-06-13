@@ -89,12 +89,22 @@ pruned on startup and never receive alerts.
 | `/list` | List watched tokens + state |
 | `/threshold <mint\|all> <pct>` | Set drawdown threshold (must be > hysteresis) |
 | `/status <mint>` | Current price, rolling ATH and drawdown |
+| `/check <mint>` | Full token card on demand (same rich layout as an alert: market cap, holders, Meteora pools…) |
 | `/resetath <mint>` | Reset stored ATH and re-arm |
 | `/scan` | Run a GMGN drawdown scan cycle now (only when the scanner is enabled) |
+| `/gmgnstatus` | Show the last GMGN scan summary (timestamp, counts, base-drop reasons, last delivered, last error) |
 | `/testalert` | Preview an example alert (rendered for SOL) without waiting for a real trigger |
 | `/help` | Show help |
 
 Mints must be base58, 32–44 chars; malformed mints are rejected with a clear reply.
+
+On startup the bot publishes a **command menu** (`setMyCommands`), so these commands
+appear in Telegram's “Menu” button and in the `/` autocomplete — users can pick a
+command instead of typing it or running `/help`.
+
+Every command reply is **threaded to the message that triggered it**, so the calling
+user is highlighted/notified — this makes the bot usable in **group chats** where many
+people issue commands at once.
 
 ## Environment variables
 
@@ -210,7 +220,16 @@ Safety & robustness:
 - **Manual trigger** — send `/scan` in Telegram to run one cycle on demand instead of
   waiting for the interval. It reuses the same overlap guard (replies "already running"
   if a cycle is in flight) and reports the cycle counts (trending → quick-pass →
-  base-pass → deliverable → new alerts).
+  base-pass → deliverable → new alerts), including a summary of **base-filter drop
+  reasons** even when some candidates pass.
+- **Observability** — `/gmgnstatus` reports the last (scheduled or manual) scan: when
+  it ran, the counts, the top base-drop reasons, the last delivered candidate, and the
+  last cycle error. Scheduled cycles also log the same drop-reason summary every tick.
+- **Fail-closed price** — a token whose current price is missing/unparseable/zero is
+  rejected at the base filter (it can no longer masquerade as a 100% drawdown).
+- **Dry run** — `bun run gmgn:dryrun` runs one real scan against the configured GMGN
+  API and prints rank/quick-pass/base-pass/security-fail/deliverable counts plus a few
+  example candidates. It never sends Telegram alerts and never prints secrets.
 
 ## Alert layout
 

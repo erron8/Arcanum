@@ -57,7 +57,8 @@ describe('formatRichBlock — GMGN', () => {
   test('renders the rich layout fields', () => {
     const b = formatRichBlock(gmgnView());
     expect(b).toContain('dogwifhat');
-    expect(b).toContain('$WIF');
+    expect(b).toContain(`[*dogwifhat*](https://gmgn.ai/sol/token/${MINT})`); // name links to GMGN
+    expect(b).toContain('$WIF'); // ticker as a cashtag (uppercase) at the title end
     expect(b).toContain('WARN');
     expect(b).toContain('Solana @ Pump');
     expect(b).toContain('FDV');
@@ -69,6 +70,11 @@ describe('formatRichBlock — GMGN', () => {
     expect(b).toContain('[GMGN]');
     expect(b).toContain('🐦 X'); // social
     expect(b).toContain('\n\n'); // sections are separated by a blank line
+    // Title carries the current market cap (bold); ATH line shows the market cap at ATH (bold).
+    expect(b).toContain('\\[*$980\\.0K*\\]'); // current FDV in the title bracket, bold
+    expect(b).toContain('🏔 ATH: *$2\\.65M*'); // ATH shown as market cap, bold
+    expect(b).toContain('⬇️*62\\.80%*'); // drawdown bold in the tag
+    expect(b).not.toContain('1H:'); // 1H line removed
   });
 
   test('verdict drives the leading emoji and tag', () => {
@@ -145,7 +151,7 @@ describe('formatRichBlock — watch', () => {
     const b = formatRichBlock(watchView());
     expect(b).toContain('🔻');
     expect(b).toContain('$BONK');
-    expect(b).toContain('thr 50\\.00%');
+    expect(b).toContain('threshold 50\\.00%');
     expect(b).toContain('USD:'); // quote=usd
   });
 

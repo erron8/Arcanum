@@ -94,8 +94,9 @@ async function main(): Promise<void> {
       watchStore: config.gmgn.autoWatch ? store : undefined,
       meteora: meteoraLinker,
     });
-    // Enable the manual /scan command (runs one cycle on demand).
+    // Enable the manual /scan command (runs one cycle on demand) + /gmgnstatus.
     bot.setGmgnScan(() => gmgnScanner!.scanNow());
+    bot.setGmgnStatus(() => gmgnScanner!.status());
   }
 
   let shuttingDown = false;

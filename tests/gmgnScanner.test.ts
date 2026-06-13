@@ -158,6 +158,35 @@ describe('baseFilter', () => {
     expect(r.marketCap).toBe(400_000);
     expect(r.pass).toBe(true);
   });
+
+  test('fails CLOSED when current price is missing, even with valid ATH + fallback mcap', () => {
+    // Regression: a missing price must NOT be treated as 0 (which would fake a 100%
+    // drawdown and let a token through on bad data).
+    const r = baseFilter(
+      { ...passing, price: undefined, market_cap: undefined, circulating_supply: undefined },
+      cfg,
+      { nowMs: NOW, fallbackMarketCap: 400_000 }, // mcap clears, ATH is valid (1.0)
+    );
+    expect(r.pass).toBe(false);
+    expect(r.drawdownPct).toBe(0); // NOT 100
+    expect(r.reasons.some((x) => x.includes('current price unavailable'))).toBe(true);
+    // The drawdown threshold reason must NOT be the thing that (accidentally) passed it.
+    expect(r.reasons.some((x) => x.startsWith('drawdown'))).toBe(false);
+  });
+
+  test('fails CLOSED when price is zero or an unparseable object', () => {
+    const zero = baseFilter({ ...passing, price: 0 }, cfg, { nowMs: NOW });
+    expect(zero.pass).toBe(false);
+    expect(zero.reasons.some((x) => x.includes('current price unavailable'))).toBe(true);
+
+    const emptyObj = baseFilter(
+      { ...passing, price: {} as GmgnTokenInfo['price'] },
+      cfg,
+      { nowMs: NOW },
+    );
+    expect(emptyObj.pass).toBe(false);
+    expect(emptyObj.drawdownPct).toBe(0);
+  });
 });
 
 describe('infoPrice', () => {
@@ -214,7 +243,7 @@ describe('buildGmgnDisplay', () => {
         { open: '0.0005', close: '0.0004', volume: '1000' },
         { open: '0.0004', close: '0.00041', volume: '2000' },
       ],
-      rankVolume: 4_700_000,
+      totalVolumeUsd: 4_700_000,
     });
     expect(view.symbol).toBe('WIF');
     expect(view.platform).toBe('Pump'); // title-cased
@@ -230,6 +259,25 @@ describe('buildGmgnDisplay', () => {
     expect(view.holderCount).toBe(4321);
     expect(view.smartMoney?.smHolding).toBe(1);
     expect(view.socials?.twitter).toBe('https://x.com/wif');
+  });
+
+  test('reads 24h volume from the info.price object when no rank volume is given', () => {
+    const view = buildGmgnDisplay({
+      info: {
+        price: { price: '0.00134', volume_24h: '1373870.98' } as GmgnTokenInfo['price'],
+      } as GmgnTokenInfo,
+    });
+    expect(view.volumeUsd).toBeCloseTo(1_373_870.98, 1);
+  });
+
+  test('derives age from info timestamps when no base is provided', () => {
+    const NOW = 1_700_000_000_000;
+    const openedAt = Math.floor((NOW - 48 * 3_600_000) / 1000); // 2 days ago
+    const view = buildGmgnDisplay({
+      info: { open_timestamp: openedAt, price: '0.001' } as GmgnTokenInfo,
+      nowMs: NOW,
+    });
+    expect(view.ageHours).toBeCloseTo(48, 1);
   });
 
   test('prefers pre-computed base values over raw info', () => {
@@ -814,5 +862,73 @@ describe('GmgnScanner shutdown', () => {
     await cycle;
     expect(stopResolved).toBe(true);
     expect(scanner.isScanning()).toBe(false);
+  });
+});
+
+describe('GmgnScanner.status', () => {
+  test('records the last summary with base-drop reasons even when some candidates pass', async () => {
+    // Two trending tokens: MINT1 passes the base filter, MINT2 fails on low total_fee.
+    const failInfo = { ...passingInfo, total_fee: 1 };
+    const routes: Array<[string, unknown]> = [
+      [
+        '/v1/market/rank',
+        {
+          data: {
+            data: {
+              rank: [
+                { address: 'MINT1', symbol: 'WIF', smart_degen_count: 2, market_cap: 500_000 },
+                { address: 'MINT2', symbol: 'BAD', smart_degen_count: 2, market_cap: 500_000 },
+              ],
+            },
+          },
+        },
+      ],
+      ['token/info?chain=sol&address=MINT2', { data: failInfo }], // MINT2: fails base
+      ['/v1/token/info', { data: passingInfo }], // MINT1: passes
+      ['/v1/token/security', { data: cleanSecurity }],
+      ['/v1/market/token_top_holders', { data: { list: [{ address: 's1', tags: ['smart_degen'], end_holding_at: null }] } }],
+      ['/v1/market/token_top_traders', { data: { list: [] } }],
+      ['/v1/market/token_kline', { data: organicKline }],
+    ];
+    const store = await newScreenedStore();
+    const scanner = new GmgnScanner(gcfg(), {
+      client: makeClient(routes),
+      store,
+      notify: async () => true,
+      now: () => NOW,
+    });
+    await scanner.runCycle();
+
+    const s = scanner.status();
+    expect(s.scanning).toBe(false);
+    expect(s.lastSummary).not.toBeNull();
+    expect(s.lastSummary!.basePass).toBe(1); // MINT1 passed…
+    expect(s.lastSummary!.baseDropSummary).toContain('total_fee'); // …and the drop reason is still recorded
+    expect(s.lastSummaryAt).toBe(NOW);
+    expect(s.lastDelivered).not.toBeNull();
+    expect(s.lastDelivered!.mint).toBe('MINT1');
+    expect(s.lastError).toBeNull();
+  });
+
+  test('records the last error when a cycle throws', async () => {
+    const client = new GmgnClient(
+      { baseUrl: 'https://x', apiKey: 'k', attempts: 1, backoffMs: 0 },
+      {
+        fetch: async () => {
+          throw new Error('network down');
+        },
+        uuid: () => 'u',
+        now: () => NOW,
+        sleep: async () => {},
+      },
+    );
+    const store = await newScreenedStore();
+    const scanner = new GmgnScanner(gcfg(), { client, store, notify: async () => true, now: () => NOW });
+    await scanner.runCycle();
+
+    const s = scanner.status();
+    expect(s.lastError).not.toBeNull();
+    expect(s.lastError!.message).toContain('network down');
+    expect(s.lastError!.at).toBe(NOW);
   });
 });

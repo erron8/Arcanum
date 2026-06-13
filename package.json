@@ -8,6 +8,7 @@
     "start": "bun run src/alerts/index.ts",
     "typecheck": "tsc --noEmit",
     "selfcheck": "bun run src/utils/selfcheck.ts",
+    "gmgn:dryrun": "bun run src/gmgn/dryrun.ts",
     "test": "bun test"
   },
   "dependencies": {

@@ -117,7 +117,14 @@ export function baseFilter(
     reasons.push(`total_fee ${totalFeeSol} < ${cfg.totalFeeMinSol} SOL`);
   }
 
-  const price = infoPrice(info.price) ?? 0;
+  // Fail closed on a missing/unparseable/non-positive current price: without a real
+  // price we cannot compute drawdown (treating it as 0 would fake a 100% drawdown and
+  // let a token through on bad data). A tradeable token always has a positive price.
+  const priceVal = infoPrice(info.price);
+  const priceKnown = priceVal !== undefined && priceVal > 0;
+  const price = priceKnown ? priceVal : 0;
+  if (!priceKnown) reasons.push('current price unavailable');
+
   // Market cap: explicit info.market_cap → price × circulating supply → rank-row
   // fallback (e.g. when info omits both). Failing all three it stays 0 and fails.
   const explicitMcap = toNum(info.market_cap);
@@ -148,10 +155,14 @@ export function baseFilter(
   }
 
   // Drawdown from ATH: prefer info.ath_price, fall back to the kline-derived high.
+  // Only computed when BOTH the current price and ATH are known — otherwise we fail
+  // closed (a missing price already added its own reason above; don't fake a drawdown).
   let athPrice = infoPrice(info.ath_price) ?? 0;
   if (!(athPrice > 0) && opts.klineAth !== undefined) athPrice = opts.klineAth;
   let drawdownPct = 0;
-  if (athPrice > 0 && price >= 0) {
+  if (!priceKnown) {
+    // current price unavailable — already failed; cannot compute a real drawdown.
+  } else if (athPrice > 0) {
     drawdownPct = ((athPrice - price) / athPrice) * 100;
     if (drawdownPct < cfg.drawdownMinPct) {
       reasons.push(`drawdown ${drawdownPct.toFixed(1)}% < ${cfg.drawdownMinPct}%`);
@@ -381,8 +392,10 @@ export interface GmgnDisplayInputs {
   holders?: GmgnWalletEntry[];
   traders?: GmgnWalletEntry[];
   recentKline?: GmgnKlineCandle[];
-  /** Total volume from the rank row (token/info has no volume of its own). */
-  rankVolume?: number;
+  /** Total (e.g. 24h) volume in USD — from the rank row or a summed kline. */
+  totalVolumeUsd?: number;
+  /** Now (epoch ms), used to derive token age from info timestamps. */
+  nowMs?: number;
   /** Pre-computed base values so we don't recompute what the scanner already has. */
   base?: {
     price?: number;
@@ -411,6 +424,22 @@ export function buildGmgnDisplay(inp: GmgnDisplayInputs): Partial<RichTokenView>
     athPrice !== undefined && supply !== undefined ? athPrice * supply : undefined;
 
   const recent = inp.recentKline ?? [];
+  // GMGN's `price` field is often a rich object carrying 24h volume / buy-sell stats.
+  const priceObj =
+    info?.price !== null && typeof info?.price === 'object'
+      ? (info.price as Record<string, unknown>)
+      : undefined;
+  // Volume: prefer an explicit total (rank row), else info.price.volume_24h.
+  const volumeUsd = inp.totalVolumeUsd ?? toNum(priceObj?.['volume_24h']);
+  // Age: prefer the pre-computed base value, else derive from info timestamps so the
+  // enricher path (which has no base) still shows token age.
+  let ageHours = inp.base?.ageHours;
+  if (ageHours === undefined) {
+    const openedAt = toNum(info?.open_timestamp) ?? toNum(info?.creation_timestamp);
+    if (openedAt !== undefined && openedAt > 0) {
+      ageHours = ((inp.nowMs ?? Date.now()) - openedAt * 1000) / HOUR_MS;
+    }
+  }
   const top10Rate =
     toNum(info?.stat?.top_10_holder_rate) ?? toNum(inp.security?.top_10_holder_rate);
   // bundler_trader_amount_rate is a 0–1 fraction (same scale screenSecurity compares).
@@ -433,9 +462,9 @@ export function buildGmgnDisplay(inp: GmgnDisplayInputs): Partial<RichTokenView>
     priceUsd: price,
     fdvUsd,
     fdvAthUsd,
-    ageHours: inp.base?.ageHours,
+    ageHours,
     liquidityUsd: toNum(info?.liquidity),
-    volumeUsd: inp.rankVolume,
+    volumeUsd,
     vol1hUsd: recent.length > 0 ? sumVolume(recent) : undefined,
     change1hPct: changePct(recent),
     athUsd: athPrice,
@@ -544,6 +573,22 @@ export interface CycleSummary {
   deliverable: number;
   fresh: number;
   delivered: boolean;
+  /** Summarized base-filter drop reasons, e.g. "market_cap×8, drawdown×3" (or ''). */
+  baseDropSummary: string;
+}
+
+/** Observable scanner state for the /gmgnstatus command. */
+export interface GmgnScanStatus {
+  /** True while a cycle is in flight. */
+  scanning: boolean;
+  /** Counts from the most recent completed cycle (null until the first finishes). */
+  lastSummary: CycleSummary | null;
+  /** When the last cycle completed (epoch ms), or null. */
+  lastSummaryAt: number | null;
+  /** The last cycle that failed outright, or null. */
+  lastError: { message: string; at: number } | null;
+  /** The most recent candidate actually delivered to subscribers, or null. */
+  lastDelivered: { mint: string; symbol?: string; at: number } | null;
 }
 
 export interface ScannerDeps {
@@ -593,6 +638,9 @@ export class GmgnScanner {
   private baseDropReasons: string[] = [];
   /** Counts from the most recent completed cycle (for the manual /scan reply). */
   private lastSummary: CycleSummary | null = null;
+  private lastSummaryAt: number | null = null;
+  private lastError: { message: string; at: number } | null = null;
+  private lastDelivered: { mint: string; symbol?: string; at: number } | null = null;
   private readonly now: () => number;
 
   constructor(
@@ -645,6 +693,10 @@ export class GmgnScanner {
         return await this.scanOnce();
       } catch (err) {
         console.error('[gmgn] scan cycle error:', err);
+        this.lastError = {
+          message: err instanceof Error ? err.message : String(err),
+          at: this.now(),
+        };
         return null;
       } finally {
         this.scanning = false;
@@ -666,6 +718,17 @@ export class GmgnScanner {
   async scanNow(): Promise<CycleSummary | null> {
     const result = await this.runCycle();
     return result === null ? null : this.lastSummary;
+  }
+
+  /** Snapshot of recent scanner activity for the /gmgnstatus command. */
+  status(): GmgnScanStatus {
+    return {
+      scanning: this.scanning,
+      lastSummary: this.lastSummary,
+      lastSummaryAt: this.lastSummaryAt,
+      lastError: this.lastError,
+      lastDelivered: this.lastDelivered,
+    };
   }
 
   /** One full scan cycle. Returns every base-passing candidate (PASS/WARN/FAIL). */
@@ -720,18 +783,23 @@ export class GmgnScanner {
             this.deps.watchStore.upsertWatch(c.mint, 50, { symbol: c.symbol });
           }
         }
+        const last = fresh[fresh.length - 1]!;
+        this.lastDelivered = { mint: last.mint, symbol: last.symbol, at: this.now() };
         console.log(`[gmgn] alerted ${fresh.length} candidate(s).`);
       }
     }
+
+    const baseDropSummary =
+      this.baseDropReasons.length > 0 ? summarizeReasons(this.baseDropReasons) : '';
 
     console.log(
       `[gmgn] cycle: ${rank.length} trending → ${candidates.length} quick-pass → ` +
         `${passed.length} base-pass → ${deliverable.length} deliverable → ${fresh.length} new`,
     );
-    // When nothing clears the base filter, surface the top reasons so a misparse
-    // (e.g. price→0→mcap 0) or simply "no token matched" is visible in the logs.
-    if (passed.length === 0 && this.baseDropReasons.length > 0) {
-      console.log(`[gmgn] base-filter drops: ${summarizeReasons(this.baseDropReasons)}`);
+    // Always surface base-filter drop reasons (even when some pass) so a misparse
+    // (e.g. price→0→mcap 0) or thin matching is visible in the logs.
+    if (baseDropSummary !== '') {
+      console.log(`[gmgn] base-filter drops: ${baseDropSummary}`);
     }
     this.lastSummary = {
       trending: rank.length,
@@ -740,7 +808,9 @@ export class GmgnScanner {
       deliverable: deliverable.length,
       fresh: fresh.length,
       delivered,
+      baseDropSummary,
     };
+    this.lastSummaryAt = this.now();
     return passed;
   }
 
@@ -828,7 +898,8 @@ export class GmgnScanner {
         holders,
         traders,
         recentKline,
-        rankVolume: toNum(item.volume),
+        totalVolumeUsd: toNum(item.volume),
+        nowMs,
         base: {
           price: base.price,
           marketCap: base.marketCap,

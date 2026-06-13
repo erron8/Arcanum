@@ -8,7 +8,7 @@ import type { MeteoraPoolLink } from '../meteora/client';
  * renderer works whether we have a full GMGN payload or only a Jupiter price/ATH.
  */
 
-export type RichAlertKind = 'watch' | 'gmgn';
+export type RichAlertKind = 'watch' | 'gmgn' | 'check';
 export type RichVerdict = 'PASS' | 'WARN' | 'FAIL';
 
 export interface RichHolder {
@@ -151,16 +151,39 @@ function socialLinks(v: RichTokenView): string[] {
  * blank line so the message is easy to scan and not cramped.
  */
 export function formatRichBlock(v: RichTokenView): string {
-  // --- title ---
-  const emoji = v.kind === 'gmgn' ? VERDICT_EMOJI[v.verdict ?? 'PASS'] : '🔻';
-  const ticker = v.symbol ? `\`$${esc(clamp(v.symbol))}\`` : `\`${esc(shortMint(v.mint))}\``;
-  const name = esc(clamp(v.name ?? v.symbol ?? shortMint(v.mint)));
+  // --- title: emoji · *name* (→GMGN) · [mcap] · [drawdown · verdict/threshold] · $TICKER ---
+  const emoji = v.kind === 'gmgn' ? VERDICT_EMOJI[v.verdict ?? 'PASS'] : v.kind === 'check' ? '🔍' : '🔻';
+  // The token NAME links to its GMGN page (primary trading terminal).
+  const gmgnUrl = `https://gmgn.ai/sol/token/${v.mint}`;
+  const nameText = `*${esc(clamp(v.name ?? v.symbol ?? shortMint(v.mint)))}*`;
+  const gmgnDest = safeLinkDest(gmgnUrl);
+  const nameLinked = gmgnDest ? `[${nameText}](${gmgnDest})` : nameText;
+
+  const fdvNow = fmtUsd(v.fdvUsd);
+  const fdvAth = fmtUsd(v.fdvAthUsd);
+  const mcapTag = fdvNow ? `  \\[*${esc(fdvNow)}*\\]` : '';
   const tagParts: string[] = [];
-  if (v.drawdownPct !== undefined) tagParts.push(`⬇${esc(fmtPct(v.drawdownPct))}%`);
+  if (v.drawdownPct !== undefined) tagParts.push(`⬇️*${esc(fmtPct(v.drawdownPct))}%*`);
   if (v.kind === 'gmgn' && v.verdict) tagParts.push(v.verdict);
-  if (v.kind === 'watch' && v.threshold !== undefined) tagParts.push(`thr ${esc(fmtPct(v.threshold))}%`);
+  if (v.kind === 'watch' && v.threshold !== undefined) {
+    tagParts.push(`threshold ${esc(fmtPct(v.threshold))}%`);
+  }
   const tag = tagParts.length > 0 ? `  \\[${tagParts.join(' · ')}\\]` : '';
-  const title = [`${emoji} *${name}* ${ticker}${tag}`];
+
+  // Ticker at the end as a plain-text cashtag (UPPERCASE) — Telegram auto-detects
+  // cashtags and tapping one searches the chat for that ticker. It must stay plain
+  // text (no link/code entity) for that detection to fire.
+  const cashtag = v.symbol ? `  ${esc(`$${clamp(v.symbol).toUpperCase()}`)}` : '';
+
+  const title = [`${emoji} ${nameLinked}${mcapTag}${tag}${cashtag}`];
+
+  // --- ATH (market cap at ATH), its own section right under the title ---
+  const ath: string[] = [];
+  if (fdvAth) {
+    ath.push(`🏔 ATH: *${esc(fdvAth)}*`);
+  } else if (v.athUsd !== undefined) {
+    ath.push(`🏔 ATH: *${esc(fmtPrice(v.athUsd))}* ${v.quote === 'native' ? 'SOL' : 'USD'}`);
+  }
 
   // --- market stats ---
   const market: string[] = [];
@@ -169,12 +192,9 @@ export function formatRichBlock(v: RichTokenView): string {
   if (v.priceUsd !== undefined) {
     market.push(`💰 ${v.quote === 'native' ? 'SOL' : 'USD'}: ${esc(fmtPrice(v.priceUsd))}`);
   }
-  const fdvNow = fmtUsd(v.fdvUsd);
-  const fdvAth = fmtUsd(v.fdvAthUsd);
   if (fdvNow || fdvAth) {
-    const age = fmtAge(v.ageHours);
     const proj = fdvNow && fdvAth ? `${esc(fdvNow)} ⇨ ${esc(fdvAth)}` : esc((fdvNow ?? fdvAth)!);
-    market.push(`💎 FDV: ${proj}${age ? `  \\[${esc(age)}\\]` : ''}`);
+    market.push(`💎 FDV: ${proj}`);
   }
   const liq = fmtUsd(v.liquidityUsd);
   if (liq) {
@@ -191,19 +211,6 @@ export function formatRichBlock(v: RichTokenView): string {
     if (vol) parts.push(`Vol: ${esc(vol)}`);
     if (age2) parts.push(`Age: ${esc(age2)}`);
     market.push(`📊 ${parts.join('  ·  ')}`);
-  }
-  const v1h = fmtUsd(v.vol1hUsd);
-  if (v1h || v.change1hPct !== undefined) {
-    const parts: string[] = [];
-    if (v1h) parts.push(esc(v1h));
-    if (v.change1hPct !== undefined) {
-      const arrow = v.change1hPct >= 0 ? '🔼' : '🔽';
-      parts.push(`${arrow} ${esc(fmtPct(v.change1hPct))}%`);
-    }
-    market.push(`📉 1H: ${parts.join('  ·  ')}`);
-  }
-  if (v.athUsd !== undefined) {
-    market.push(`🏔 ATH: ${esc(fmtPrice(v.athUsd))} ${v.quote === 'native' ? 'SOL' : 'USD'}`);
   }
 
   // --- holders + screening flags ---
@@ -259,7 +266,7 @@ export function formatRichBlock(v: RichTokenView): string {
   const contract = [`\`${esc(v.mint)}\``];
 
   // Join sections with a blank line, skipping any empty section.
-  return [title, market, holders, links, meteora, contract]
+  return [title, ath, market, holders, links, meteora, contract]
     .filter((section) => section.length > 0)
     .map((section) => section.join('\n'))
     .join('\n\n');
@@ -270,7 +277,7 @@ export function formatRichBlock(v: RichTokenView): string {
  * an oversized alert never drops the whole message. Built from bounded fields only.
  */
 function minimalBlock(v: RichTokenView): string {
-  const emoji = v.kind === 'gmgn' ? VERDICT_EMOJI[v.verdict ?? 'PASS'] : '🔻';
+  const emoji = v.kind === 'gmgn' ? VERDICT_EMOJI[v.verdict ?? 'PASS'] : v.kind === 'check' ? '🔍' : '🔻';
   const dd = v.drawdownPct !== undefined ? ` down ${esc(fmtPct(v.drawdownPct))}% from ATH` : '';
   return `${emoji} \`${esc(v.mint)}\`${dd}`;
 }
@@ -279,6 +286,9 @@ function minimalBlock(v: RichTokenView): string {
 function headerFor(kind: RichAlertKind, count: number): string {
   if (kind === 'gmgn') {
     return count === 1 ? '🔎 *GMGN Screening Alert*' : `🔎 *GMGN Screening Alerts* \\(${count}\\)`;
+  }
+  if (kind === 'check') {
+    return count === 1 ? '🔍 *Token Check*' : `🔍 *Token Check* \\(${count}\\)`;
   }
   return count === 1 ? '🔻 *ATH Drawdown Alert*' : `🔻 *ATH Drawdown Alerts* \\(${count}\\)`;
 }

@@ -9,7 +9,7 @@ import { TelegramTransport } from '../src/alerts/telegramBot';
 import { buildConfig } from '../src/alerts/config';
 import type { AppConfig } from '../src/alerts/config';
 import type { ChartDataPoint, AlertPayload } from '../src/models/types';
-import type { Update } from 'grammy/types';
+import type { Update, BotCommand } from 'grammy/types';
 
 function tmpFile(prefix: string): string {
   return join(tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
@@ -51,6 +51,7 @@ async function makeTransport(
   subscribers: number[],
   fetcher: ChartFetcher = emptyFetcher,
   symbol: string | undefined = undefined,
+  enrichTimeoutMs: number | undefined = undefined,
 ): Promise<{ bot: TelegramTransport; store: AlertStore; subsPath: string }> {
   const subsPath = tmpFile('subs');
   await fs.writeFile(subsPath, JSON.stringify(subscribers), 'utf8');
@@ -66,6 +67,7 @@ async function makeTransport(
   // Inject a symbol stub so command tests never hit the network.
   const bot = new TelegramTransport('111:FAKE', store, monitor, cfg, {
     fetchSymbol: async () => symbol,
+    enrichTimeoutMs,
   });
   return { bot, store, subsPath };
 }
@@ -240,6 +242,25 @@ describe('TelegramTransport delivery (confirmed)', () => {
     expect(sent.map((s) => s.text).join('\n')).toContain('ATH Drawdown Alert');
   });
 
+  test('slow enrichment does not delay the alert (bounded by enrichTimeoutMs)', async () => {
+    // Tiny 20ms timeout; enricher/linker that never resolve. The alert must still
+    // send promptly as the basic view (no enriched FDV / Meteora line).
+    const { bot } = await makeTransport({ allowedChatIds: [1] }, [1], emptyFetcher, undefined, 20);
+    await bot.init();
+    const sent = recorder(bot);
+    bot.setGmgnEnricher(() => new Promise(() => {})); // never resolves
+    bot.setMeteoraLinker(() => new Promise(() => {})); // never resolves
+    const started = Date.now();
+    const accepted = await bot.buildSink()([payload('m1')]);
+    const elapsed = Date.now() - started;
+    expect(accepted).toEqual(['m1']); // delivered despite hanging enrichment
+    expect(elapsed).toBeLessThan(1000); // not blocked on the hung promises
+    const msg = sent.map((s) => s.text).join('\n');
+    expect(msg).toContain('ATH Drawdown Alert');
+    expect(msg).not.toContain('FDV'); // enrichment timed out → basic view
+    expect(msg).not.toContain('Meteora'); // linker timed out → no pool line
+  });
+
   test('a 5xx/network failure is NOT accepted (alert will retry)', async () => {
     const { bot } = await makeTransport({}, [42]);
     await bot.init();
@@ -389,7 +410,7 @@ describe('TelegramTransport commands (real handler path)', () => {
     expect(sent.some((m) => m.text.includes('not enabled'))).toBe(true);
   });
 
-  test('/scan runs a cycle and reports the summary', async () => {
+  test('/scan runs a cycle and reports the summary + base-drop reasons', async () => {
     const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
     bot.setGmgnScan(async () => ({
       trending: 25,
@@ -398,11 +419,14 @@ describe('TelegramTransport commands (real handler path)', () => {
       deliverable: 2,
       fresh: 1,
       delivered: true,
+      baseDropSummary: 'market_cap×6, drawdown×2',
     }));
     const sent = recorder(bot);
     await bot.handleUpdate(cmdUpdate(7, '/scan'));
     await waitUntil(() => sent.some((m) => m.text.includes('scan complete')));
-    expect(sent.some((m) => m.text.includes('Sent *1* new alert'))).toBe(true);
+    const text = sent.map((m) => m.text).join('\n');
+    expect(text).toContain('Sent *1* new alert');
+    expect(text).toContain('cap×6'); // base-drops surfaced even though 2 passed ("_" is escaped)
   });
 
   test('/scan reports an in-progress cycle when the trigger returns null', async () => {
@@ -411,6 +435,40 @@ describe('TelegramTransport commands (real handler path)', () => {
     const sent = recorder(bot);
     await bot.handleUpdate(cmdUpdate(7, '/scan'));
     await waitUntil(() => sent.some((m) => m.text.includes('already running')));
+  });
+
+  test('/gmgnstatus is off when no status provider is wired', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/gmgnstatus'));
+    expect(sent.some((m) => m.text.includes('not enabled'))).toBe(true);
+  });
+
+  test('/gmgnstatus shows last summary, base-drops, delivered, and error', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    bot.setGmgnStatus(() => ({
+      scanning: false,
+      lastSummary: {
+        trending: 25,
+        quickPass: 8,
+        basePass: 3,
+        deliverable: 3,
+        fresh: 1,
+        delivered: true,
+        baseDropSummary: 'market_cap×5',
+      },
+      lastSummaryAt: Date.now() - 60_000,
+      lastError: { message: 'rank 429', at: Date.now() - 120_000 },
+      lastDelivered: { mint: MINT, symbol: 'WIF', at: Date.now() - 30_000 },
+    }));
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/gmgnstatus'));
+    const text = sent.map((m) => m.text).join('\n');
+    expect(text).toContain('GMGN scanner status');
+    expect(text).toContain('Base\\-pass: *3*');
+    expect(text).toContain('cap×5'); // "_" in market_cap is escaped
+    expect(text).toContain('WIF');
+    expect(text).toContain('rank 429');
   });
 
   test('/testalert previews both alert styles with live Meteora links', async () => {
@@ -434,5 +492,109 @@ describe('TelegramTransport commands (real handler path)', () => {
     await bot.handleUpdate(cmdUpdate(7, '/testalert'));
     await waitUntil(() => sent.some((m) => m.text.includes('Example alerts')));
     expect(sent.map((m) => m.text).join('\n')).toContain(SOL_MINT_FOR_TEST);
+  });
+
+  test('/check renders the full token card in USD with volume + age', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, [], fetcherWith(50, 100));
+    bot.setGmgnEnricher(async () => ({
+      symbol: 'WIF',
+      fdvUsd: 980_000,
+      fdvAthUsd: 2_650_000,
+      priceUsd: 0.00042,
+      athUsd: 0.00113,
+      volumeUsd: 4_700_000,
+      ageHours: 52,
+      holderCount: 4321,
+    }));
+    bot.setMeteoraLinker(async () => [
+      { poolAddress: 'P1', pair: 'WIF/SOL', binStep: 80, baseFeePct: 0.8, url: 'https://app.meteora.ag/dlmm/P1' },
+    ]);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, `/check ${MINT}`));
+    await waitUntil(() => sent.some((m) => m.text.includes('Token Check')));
+    const all = sent.map((m) => m.text).join('\n');
+    expect(all).toContain(MINT); // contract line
+    expect(all).toContain('USD:'); // price shown in USD (not SOL), from GMGN
+    expect(all).toContain('FDV'); // enriched market cap
+    expect(all).toContain('Vol:'); // 24h volume present
+    expect(all).toContain('Age:'); // token age present
+    expect(all).toContain('WIF/SOL 80/0\\.8%'); // Meteora pool link
+    expect(all).not.toContain('SOL: '); // price must not be denominated in SOL
+  });
+
+  test('/check rejects an invalid mint', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/check not-a-mint'));
+    expect(sent.some((m) => m.text.includes('Usage'))).toBe(true);
+  });
+});
+
+describe('TelegramTransport reply threading (group tagging)', () => {
+  /** Capture full sendMessage payloads (incl. reply_parameters). */
+  function payloadRecorder(bot: TelegramTransport): Record<string, unknown>[] {
+    const seen: Record<string, unknown>[] = [];
+    bot.useApiInterceptor((method, p) => {
+      if (method === 'getMe') return getMeResult;
+      if (method === 'sendMessage') seen.push(p);
+      return ok;
+    });
+    return seen;
+  }
+
+  test('a synchronous command reply is threaded to the caller message', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    const seen = payloadRecorder(bot);
+    const upd = cmdUpdate(7, '/help');
+    await bot.handleUpdate(upd);
+    const msgId = (upd as unknown as { message: { message_id: number } }).message.message_id;
+    expect(seen.length).toBeGreaterThan(0);
+    expect((seen[0]!.reply_parameters as { message_id?: number })?.message_id).toBe(msgId);
+  });
+
+  test('async command follow-ups are also threaded to the caller', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, [], fetcherWith(50, 100));
+    const seen = payloadRecorder(bot);
+    const upd = cmdUpdate(7, `/check ${MINT}`);
+    await bot.handleUpdate(upd);
+    await waitUntil(() => seen.some((p) => String(p.text).includes('Token Check')));
+    const msgId = (upd as unknown as { message: { message_id: number } }).message.message_id;
+    // Every reply (ack + the card) references the caller's message.
+    for (const p of seen) {
+      expect((p.reply_parameters as { message_id?: number })?.message_id).toBe(msgId);
+    }
+  });
+});
+
+describe('TelegramTransport command menu', () => {
+  test('lists the user-facing commands and respects Telegram limits', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    const menu = bot.commandMenu();
+    const names = menu.map((c) => c.command);
+    for (const expected of ['start', 'watch', 'list', 'scan', 'testalert', 'help', 'stop']) {
+      expect(names).toContain(expected);
+    }
+    // Telegram constraints: command 1–32 chars, [a-z0-9_]; description 1–256 chars.
+    for (const c of menu) {
+      expect(c.command).toMatch(/^[a-z0-9_]{1,32}$/);
+      expect(c.description.length).toBeGreaterThanOrEqual(1);
+      expect(c.description.length).toBeLessThanOrEqual(256);
+    }
+    expect(new Set(names).size).toBe(names.length); // no duplicates
+  });
+
+  test('publishes the menu via setMyCommands on start', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    let setCommandsPayload: unknown;
+    bot.useApiInterceptor((method, p) => {
+      if (method === 'getMe') return getMeResult;
+      if (method === 'setMyCommands') setCommandsPayload = p.commands;
+      if (method === 'getUpdates') return { ok: true, result: [] };
+      return ok;
+    });
+    await bot.start();
+    await bot.stop();
+    expect(Array.isArray(setCommandsPayload)).toBe(true);
+    expect((setCommandsPayload as BotCommand[]).some((c) => c.command === 'watch')).toBe(true);
   });
 });

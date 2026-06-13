@@ -8,10 +8,11 @@ const CHAIN = 'sol';
 export type GmgnEnricher = (mint: string) => Promise<Partial<RichTokenView> | null>;
 
 /**
- * Build a best-effort GMGN enricher for /watch alerts: it pulls token info, security,
- * holders/traders and a recent kline window, then maps them into rich-view display
- * fields. Every sub-fetch is guarded so a single failing endpoint still yields a
- * partial view (and a total failure simply falls back to the basic watch view).
+ * Build a best-effort GMGN enricher for /watch and /check: it pulls token info,
+ * security and holders/traders, then maps them into rich-view display fields (volume
+ * and age are derived from the token-info payload itself). Every sub-fetch is guarded
+ * so a single failing endpoint still yields a partial view (a total failure falls back
+ * to the basic view).
  */
 export function makeGmgnEnricher(client: GmgnClient): GmgnEnricher {
   return async (mint) => {
@@ -22,10 +23,6 @@ export function makeGmgnEnricher(client: GmgnClient): GmgnEnricher {
       client.getTopHolders(CHAIN, mint, 100).catch(() => []),
       client.getTopTraders(CHAIN, mint, 100).catch(() => []),
     ]);
-    const toSec = Math.floor(Date.now() / 1000);
-    const recentKline = await client
-      .getKline(CHAIN, mint, '5m', toSec - 3600, toSec)
-      .catch(() => []);
-    return buildGmgnDisplay({ info, security, holders, traders, recentKline });
+    return buildGmgnDisplay({ info, security, holders, traders, nowMs: Date.now() });
   };
 }

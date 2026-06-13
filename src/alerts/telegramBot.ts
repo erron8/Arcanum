@@ -1,8 +1,8 @@
 import { promises as fs } from 'node:fs';
 import { dirname } from 'node:path';
 import { createServer } from 'node:http';
-import { Bot, GrammyError, webhookCallback } from 'grammy';
-import type { Update } from 'grammy/types';
+import { Bot, Context, GrammyError, webhookCallback } from 'grammy';
+import type { Update, BotCommand } from 'grammy/types';
 import { fetchTokenSymbol } from '../fetchers/chartData';
 import type { AlertPayload } from '../models/types';
 import type { AlertStore } from './store';
@@ -12,7 +12,7 @@ import { isChatAuthorized } from './auth';
 import { escMarkdownV2 as esc, fmtPrice, fmtPct } from './format';
 import { formatRichMessages } from './richFormat';
 import type { RichTokenView } from './richFormat';
-import type { CycleSummary } from '../gmgn/scanner';
+import type { CycleSummary, GmgnScanStatus } from '../gmgn/scanner';
 import type { GmgnEnricher } from '../gmgn/enrich';
 import type { MeteoraLinker, MeteoraPoolLink } from '../meteora/client';
 
@@ -21,6 +21,15 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 /** Runs one GMGN scan cycle on demand; null means a cycle was already running. */
 export type GmgnScanTrigger = () => Promise<CycleSummary | null>;
+
+/** Returns a snapshot of recent GMGN scanner activity for /gmgnstatus. */
+export type GmgnStatusProvider = () => GmgnScanStatus;
+
+/**
+ * Default cap on how long a /watch alert waits for GMGN + Meteora enrichment before
+ * sending the basic alert anyway. Critical alerts must not be delayed by slow lookups.
+ */
+const ENRICH_TIMEOUT_MS = 2_500;
 
 /** base58, 32–44 chars (Solana mint). */
 const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -44,6 +53,30 @@ export type SymbolFetcher = (mint: string) => Promise<string | undefined>;
 
 export interface TelegramDeps {
   fetchSymbol?: SymbolFetcher;
+  /** Override the /watch enrichment timeout (ms). Defaults to ENRICH_TIMEOUT_MS. */
+  enrichTimeoutMs?: number;
+}
+
+/**
+ * Resolve `p`, but fall back to `fallback` if it doesn't settle within `ms`. A
+ * rejected promise also yields the fallback. Used to bound best-effort enrichment so
+ * a slow upstream never delays a critical alert.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    let settled = false;
+    const finish = (v: T): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(fallback), ms);
+    p.then(
+      (v) => finish(v),
+      () => finish(fallback),
+    );
+  });
 }
 
 export class TelegramTransport {
@@ -57,6 +90,9 @@ export class TelegramTransport {
   private gmgnEnrich: GmgnEnricher | null = null;
   /** Optional Meteora DLMM linker; adds pool links to /watch alerts. */
   private meteoraLink: MeteoraLinker | null = null;
+  /** Optional GMGN scanner status provider; enables /gmgnstatus. */
+  private gmgnStatus: GmgnStatusProvider | null = null;
+  private readonly enrichTimeoutMs: number;
 
   constructor(
     token: string,
@@ -67,6 +103,7 @@ export class TelegramTransport {
   ) {
     this.bot = new Bot(token);
     this.fetchSymbol = deps.fetchSymbol ?? fetchTokenSymbol;
+    this.enrichTimeoutMs = deps.enrichTimeoutMs ?? ENRICH_TIMEOUT_MS;
     this.registerAuth();
     this.registerCommands();
     this.bot.catch((err) => console.error('[telegram] bot error:', err.error));
@@ -137,6 +174,11 @@ export class TelegramTransport {
     this.meteoraLink = linker;
   }
 
+  /** Wire a GMGN scanner status provider, enabling the /gmgnstatus command. */
+  setGmgnStatus(provider: GmgnStatusProvider): void {
+    this.gmgnStatus = provider;
+  }
+
   /**
    * Test seam: intercept outgoing Bot API calls. The handler returns an
    * ApiResponse-like object; grammY throws a GrammyError when `ok` is false,
@@ -176,6 +218,14 @@ export class TelegramTransport {
     // start the monitor, so a bad token fails fast instead of looking "alive".
     await this.bot.init();
     console.log(`[telegram] authenticated as @${this.bot.botInfo.username}`);
+
+    // Publish the command menu (the list shown when a user types "/" or taps Menu).
+    // Best-effort: a failure here must not block startup.
+    try {
+      await this.bot.api.setMyCommands(this.commandMenu());
+    } catch (err) {
+      console.warn('[telegram] could not set command menu:', err);
+    }
 
     const webhookUrl = this.cfg.webhookUrl;
     if (webhookUrl) {
@@ -313,26 +363,35 @@ export class TelegramTransport {
 
   /**
    * Fetch the optional GMGN display fields + Meteora pool links for a mint. Both are
-   * independent and best-effort, run in parallel; failures resolve to empty so an
-   * alert always renders.
+   * independent and best-effort, run in parallel, and each is bounded by
+   * `enrichTimeoutMs` so a slow upstream can't delay the alert: on timeout (or error)
+   * the field is simply omitted and the alert still renders/sends.
    */
   private async fetchEnrichment(
     mint: string,
   ): Promise<{ extra: Partial<RichTokenView>; pools: MeteoraPoolLink[] }> {
-    const [extra, pools] = await Promise.all([
-      this.gmgnEnrich
-        ? this.gmgnEnrich(mint).catch((err) => {
+    const ms = this.enrichTimeoutMs;
+    const extraP: Promise<Partial<RichTokenView> | null> = this.gmgnEnrich
+      ? withTimeout(
+          this.gmgnEnrich(mint).catch((err) => {
             console.error(`[telegram] GMGN enrich ${mint} failed:`, err);
             return null;
-          })
-        : Promise.resolve(null),
-      this.meteoraLink
-        ? this.meteoraLink(mint).catch((err) => {
+          }),
+          ms,
+          null,
+        )
+      : Promise.resolve(null);
+    const poolsP: Promise<MeteoraPoolLink[]> = this.meteoraLink
+      ? withTimeout(
+          this.meteoraLink(mint).catch((err) => {
             console.error(`[telegram] Meteora links ${mint} failed:`, err);
             return [];
-          })
-        : Promise.resolve([]),
-    ]);
+          }),
+          ms,
+          [],
+        )
+      : Promise.resolve([]);
+    const [extra, pools] = await Promise.all([extraP, poolsP]);
     return { extra: extra ?? {}, pools };
   }
 
@@ -342,7 +401,7 @@ export class TelegramTransport {
    * live GMGN record for the SOL mint is not representative of a memecoin alert), but
    * keeps the **live Meteora DLMM pool links** for the SOL mint (SOL/USDC etc.).
    */
-  async processExample(chatId: number): Promise<void> {
+  async processExample(chatId: number, replyTo?: number): Promise<void> {
     let pools: MeteoraPoolLink[] = [];
     if (this.meteoraLink) {
       try {
@@ -388,9 +447,10 @@ export class TelegramTransport {
     await this.sendDirect(
       chatId,
       '🧪 *Example alerts* — sample render \\(SOL\\)\\. Preview only, not a real trigger\\.',
+      replyTo,
     );
     const messages = [...formatRichMessages([watchView]), ...formatRichMessages([gmgnView])];
-    for (const m of messages) await this.sendDirect(chatId, m);
+    for (const m of messages) await this.sendDirect(chatId, m, replyTo);
   }
 
   /**
@@ -514,36 +574,66 @@ export class TelegramTransport {
     });
   }
 
+  /**
+   * The command menu published to Telegram via setMyCommands — the list users see
+   * when they type "/" or tap the Menu button. Descriptions are plain text (no
+   * MarkdownV2) and kept short. Exposed for inspection/testing.
+   */
+  commandMenu(): BotCommand[] {
+    return [
+      { command: 'start', description: 'Subscribe this chat to alerts' },
+      { command: 'watch', description: 'Watch a token: /watch <mint> [pct]' },
+      { command: 'unwatch', description: 'Stop watching a token: /unwatch <mint>' },
+      { command: 'list', description: 'List watched tokens' },
+      { command: 'threshold', description: 'Set drawdown threshold: /threshold <mint|all> <pct>' },
+      { command: 'status', description: 'Token price, ATH and drawdown: /status <mint>' },
+      { command: 'check', description: 'Full token card for any mint: /check <mint>' },
+      { command: 'resetath', description: 'Reset stored ATH and re-arm: /resetath <mint>' },
+      { command: 'scan', description: 'Run a GMGN drawdown scan now' },
+      { command: 'gmgnstatus', description: 'Show the last GMGN scan summary' },
+      { command: 'testalert', description: 'Preview an example alert' },
+      { command: 'stop', description: 'Unsubscribe this chat from alerts' },
+      { command: 'help', description: 'Show all commands' },
+    ];
+  }
+
   // --- commands ------------------------------------------------------------
   private registerCommands(): void {
     const bot = this.bot;
 
     bot.command('start', async (ctx) => {
       this.remember(ctx.chat?.id);
-      await ctx.reply(
+      await this.replyTo(
+        ctx,
         [
           '👋 *ATH Drawdown Bot*',
-          'You will receive an alert when a watched token falls a set % below its rolling all\\-time high\\.',
           '',
-          'Use /help to see all commands\\.',
+          'I ping you the moment a token you watch drops a set % below its rolling all\\-time high\\.',
+          '',
+          '🚀 *Get started*',
+          '   📈  /watch `<mint>` — watch a token',
+          '   🔍  /check `<mint>` — full token card',
+          '   📋  /list — your watchlist',
+          '   ❓  /help — see every command',
+          '',
+          '🔔 You are now subscribed to alerts\\.',
         ].join('\n'),
-        { parse_mode: 'MarkdownV2' },
       );
     });
 
     bot.command('stop', async (ctx) => {
       const chatId = ctx.chat?.id;
       const removed = chatId !== undefined && this.unsubscribe(chatId);
-      await ctx.reply(
+      await this.replyTo(
+        ctx,
         removed
-          ? '🔕 You are unsubscribed and will no longer receive alerts\\. Use /start to resubscribe\\.'
-          : 'You were not subscribed\\.',
-        { parse_mode: 'MarkdownV2' },
+          ? ['🔕 *Unsubscribed*', '', 'You are unsubscribed and will no longer receive alerts\\.', 'Use /start to resubscribe\\.'].join('\n')
+          : 'ℹ️ You were not subscribed\\.',
       );
     });
 
     bot.command('help', async (ctx) => {
-      await ctx.reply(HELP_TEXT, { parse_mode: 'MarkdownV2' });
+      await this.replyTo(ctx, HELP_TEXT);
     });
 
     bot.command('watch', async (ctx) => {
@@ -551,16 +641,17 @@ export class TelegramTransport {
       const parts = (ctx.match ?? '').trim().split(/\s+/).filter(Boolean);
       const mint = parts[0];
       if (!mint || !isValidMint(mint)) {
-        await ctx.reply('Usage: `/watch <mint> [pct]` — mint must be base58, 32–44 chars\\.', {
-          parse_mode: 'MarkdownV2',
-        });
+        await this.replyTo(
+          ctx,
+          ['ℹ️ *Usage*  `/watch <mint> [pct]`', '', 'The mint must be base58, 32–44 chars\\.'].join('\n'),
+        );
         return;
       }
       let threshold = this.cfg.defaultThresholdPct;
       if (parts[1] !== undefined) {
         const err = this.validateThreshold(parts[1]);
         if (err) {
-          await ctx.reply(err, { parse_mode: 'MarkdownV2' });
+          await this.replyTo(ctx, err);
           return;
         }
         threshold = Number(parts[1]);
@@ -568,45 +659,51 @@ export class TelegramTransport {
 
       // Ack immediately so webhook mode never blocks on the (slow) Jupiter call,
       // then do verification + persistence asynchronously and follow up.
-      await ctx.reply('⏳ Verifying token on Jupiter…', { parse_mode: 'MarkdownV2' });
+      await this.replyTo(ctx, '⏳ Verifying token on Jupiter…');
       const chatId = ctx.chat?.id;
-      if (chatId !== undefined) void this.processWatch(chatId, mint, threshold);
+      if (chatId !== undefined) void this.processWatch(chatId, mint, threshold, ctx.msgId);
     });
 
     bot.command('unwatch', async (ctx) => {
       const mint = (ctx.match ?? '').trim().split(/\s+/)[0];
       if (!mint || !isValidMint(mint)) {
-        await ctx.reply('Usage: `/unwatch <mint>`', { parse_mode: 'MarkdownV2' });
+        await this.replyTo(ctx, 'ℹ️ *Usage*  `/unwatch <mint>`');
         return;
       }
       const removed = this.store.remove(mint);
-      await ctx.reply(
-        removed ? `🗑️ Stopped watching \`${esc(mint)}\`\\.` : 'That mint is not being watched\\.',
-        { parse_mode: 'MarkdownV2' },
+      await this.replyTo(
+        ctx,
+        removed
+          ? ['🗑️ *Stopped watching*', '', `\`${esc(mint)}\``].join('\n')
+          : 'ℹ️ That mint is not on your watchlist\\.',
       );
     });
 
     bot.command('list', async (ctx) => {
       const entries = Object.entries(this.store.list());
       if (entries.length === 0) {
-        await ctx.reply('No tokens are being watched\\. Add one with `/watch <mint>`\\.', {
-          parse_mode: 'MarkdownV2',
-        });
+        await this.replyTo(
+          ctx,
+          ['📋 *Watched tokens*', '', 'Your watchlist is empty\\.', 'Add one with `/watch <mint>`\\.'].join('\n'),
+        );
         return;
       }
-      const lines = entries.map(([mint, e]) => {
+      const blocks = entries.map(([mint, e]) => {
         const name = e.symbol ? esc(e.symbol) : esc(`${mint.slice(0, 4)}…${mint.slice(-4)}`);
-        let line = `• *${name}* \`${esc(mint)}\` — ${esc(fmtPct(e.threshold))}% \\[${e.state}\\]`;
+        const stateIcon = e.state === 'TRIGGERED' ? '🔴' : '🟢';
+        let block = `${stateIcon} *${name}*  ·  🎯 ${esc(fmtPct(e.threshold))}%\n\`${esc(mint)}\``;
         if (e.lastDrawdownPct !== undefined) {
-          line += `\n   ↳ now ${esc(fmtPct(e.lastDrawdownPct))}% down`;
-          if (e.lastCheckedAt) line += ` · ${esc(ageString(e.lastCheckedAt))}`;
-          if (e.lastStale) line += ' · ⚠️ stale';
+          let line = `   ↳ 📉 now ${esc(fmtPct(e.lastDrawdownPct))}% down`;
+          if (e.lastCheckedAt) line += `  ·  🕒 ${esc(ageString(e.lastCheckedAt))}`;
+          if (e.lastStale) line += '  ·  ⚠️ stale';
+          block += `\n${line}`;
         } else {
-          line += '\n   ↳ _not checked yet_';
+          block += '\n   ↳ _not checked yet_';
         }
-        return line;
+        return block;
       });
-      await ctx.reply(['*Watched tokens:*', ...lines].join('\n'), { parse_mode: 'MarkdownV2' });
+      const header = `📋 *Watched tokens* \\(${entries.length}\\)`;
+      await this.replyTo(ctx, [header, ...blocks].join('\n\n'));
     });
 
     bot.command('threshold', async (ctx) => {
@@ -614,125 +711,209 @@ export class TelegramTransport {
       const target = parts[0];
       const pctStr = parts[1];
       if (!target || pctStr === undefined) {
-        await ctx.reply('Usage: `/threshold <mint|all> <pct>`', { parse_mode: 'MarkdownV2' });
+        await this.replyTo(ctx, 'ℹ️ *Usage*  `/threshold <mint|all> <pct>`');
         return;
       }
       const err = this.validateThreshold(pctStr);
       if (err) {
-        await ctx.reply(err, { parse_mode: 'MarkdownV2' });
+        await this.replyTo(ctx, err);
         return;
       }
       const pct = Number(pctStr);
       if (target.toLowerCase() === 'all') {
         const n = this.store.setThresholdAll(pct);
-        await ctx.reply(`Updated *${n}* token\\(s\\) to *${esc(fmtPct(pct))}%*\\.`, {
-          parse_mode: 'MarkdownV2',
-        });
+        await this.replyTo(ctx, `🎯 Updated *${n}* token\\(s\\) to *${esc(fmtPct(pct))}%* drawdown\\.`);
         return;
       }
       if (!isValidMint(target)) {
-        await ctx.reply('Mint must be base58, 32–44 chars \\(or `all`\\)\\.', {
-          parse_mode: 'MarkdownV2',
-        });
+        await this.replyTo(ctx, 'ℹ️ Mint must be base58, 32–44 chars \\(or `all`\\)\\.');
         return;
       }
       const ok = this.store.setThreshold(target, pct);
-      await ctx.reply(
+      await this.replyTo(
+        ctx,
         ok
-          ? `✅ \`${esc(target)}\` threshold set to *${esc(fmtPct(pct))}%*\\.`
-          : 'That mint is not being watched\\.',
-        { parse_mode: 'MarkdownV2' },
+          ? ['🎯 *Threshold updated*', '', `\`${esc(target)}\``, `Now alerting at *${esc(fmtPct(pct))}%* drawdown\\.`].join('\n')
+          : 'ℹ️ That mint is not on your watchlist\\.',
       );
     });
 
     bot.command('status', async (ctx) => {
       const mint = (ctx.match ?? '').trim().split(/\s+/)[0];
       if (!mint || !isValidMint(mint)) {
-        await ctx.reply('Usage: `/status <mint>`', { parse_mode: 'MarkdownV2' });
+        await this.replyTo(ctx, 'ℹ️ *Usage*  `/status <mint>`');
         return;
       }
       // Ack immediately; fetch + reply asynchronously so webhook mode stays responsive.
-      await ctx.reply('⏳ Fetching…', { parse_mode: 'MarkdownV2' });
+      await this.replyTo(ctx, '⏳ Fetching…');
       const chatId = ctx.chat?.id;
-      if (chatId !== undefined) void this.processStatus(chatId, mint);
+      if (chatId !== undefined) void this.processStatus(chatId, mint, ctx.msgId);
+    });
+
+    bot.command('check', async (ctx) => {
+      this.remember(ctx.chat?.id);
+      const mint = (ctx.match ?? '').trim().split(/\s+/)[0];
+      if (!mint || !isValidMint(mint)) {
+        await this.replyTo(
+          ctx,
+          ['ℹ️ *Usage*  `/check <mint>`', '', 'Shows the full token card \\(market cap, holders, pools…\\)\\.'].join('\n'),
+        );
+        return;
+      }
+      // Ack immediately; the full lookup (Jupiter + GMGN + Meteora) can take a moment.
+      await this.replyTo(ctx, '🔍 Fetching token details…');
+      const chatId = ctx.chat?.id;
+      if (chatId !== undefined) void this.processCheck(chatId, mint, ctx.msgId);
     });
 
     bot.command('resetath', async (ctx) => {
       const mint = (ctx.match ?? '').trim().split(/\s+/)[0];
       if (!mint || !isValidMint(mint)) {
-        await ctx.reply('Usage: `/resetath <mint>`', { parse_mode: 'MarkdownV2' });
+        await this.replyTo(ctx, 'ℹ️ *Usage*  `/resetath <mint>`');
         return;
       }
       const ok = this.store.resetAth(mint);
-      await ctx.reply(
+      await this.replyTo(
+        ctx,
         ok
-          ? `♻️ Reset stored ATH for \`${esc(mint)}\` \\(re\\-armed\\)\\.`
-          : 'That mint is not being watched\\.',
-        { parse_mode: 'MarkdownV2' },
+          ? ['♻️ *ATH reset & re\\-armed*', '', `\`${esc(mint)}\``].join('\n')
+          : 'ℹ️ That mint is not on your watchlist\\.',
       );
     });
 
     bot.command('scan', async (ctx) => {
       this.remember(ctx.chat?.id);
       if (!this.gmgnScan) {
-        await ctx.reply(
-          'GMGN scanner is not enabled\\. Set `GMGN_SCAN_ENABLED=true` \\(and `GMGN_API_KEY`\\) to use this\\.',
-          { parse_mode: 'MarkdownV2' },
+        await this.replyTo(
+          ctx,
+          ['🛑 *GMGN scanner is not enabled*', '', 'Set `GMGN_SCAN_ENABLED=true` and `GMGN_API_KEY` to use this\\.'].join('\n'),
         );
         return;
       }
       // Ack immediately; the cycle can take several seconds (rank + per-token detail).
-      await ctx.reply('⏳ Running a GMGN scan cycle…', { parse_mode: 'MarkdownV2' });
+      await this.replyTo(ctx, '⏳ Running a GMGN scan cycle…');
       const chatId = ctx.chat?.id;
-      if (chatId !== undefined) void this.processScan(chatId);
+      if (chatId !== undefined) void this.processScan(chatId, ctx.msgId);
+    });
+
+    bot.command('gmgnstatus', async (ctx) => {
+      this.remember(ctx.chat?.id);
+      await this.replyTo(ctx, this.gmgnStatusText());
     });
 
     bot.command('testalert', async (ctx) => {
       this.remember(ctx.chat?.id);
       // Ack immediately; enrichment (GMGN + Meteora) can take a moment.
-      await ctx.reply('🧪 Building an example alert…', { parse_mode: 'MarkdownV2' });
+      await this.replyTo(ctx, '🧪 Building an example alert…');
       const chatId = ctx.chat?.id;
-      if (chatId !== undefined) void this.processExample(chatId);
+      if (chatId !== undefined) void this.processExample(chatId, ctx.msgId);
     });
   }
 
+  /** Build the MarkdownV2 reply for /gmgnstatus from the scanner status provider. */
+  private gmgnStatusText(): string {
+    if (!this.gmgnStatus) {
+      return ['🛑 *GMGN scanner is not enabled*', '', 'Set `GMGN_SCAN_ENABLED=true` and `GMGN_API_KEY` to use this\\.'].join('\n');
+    }
+    const s = this.gmgnStatus();
+    const lines: string[] = ['📊 *GMGN scanner status*', ''];
+    lines.push(s.scanning ? '⚙️ State: _scanning…_' : '💤 State: idle');
+
+    if (s.lastSummary && s.lastSummaryAt !== null) {
+      const m = s.lastSummary;
+      lines.push(`🕒 Last scan: ${esc(ageString(s.lastSummaryAt))}`);
+      lines.push('');
+      lines.push(`📈 Trending: *${m.trending}*  ·  ⚡ Quick\\-pass: *${m.quickPass}*`);
+      lines.push(`✅ Base\\-pass: *${m.basePass}*  ·  📨 Deliverable: *${m.deliverable}*`);
+      lines.push(`🆕 New: *${m.fresh}*  ·  📤 Delivered: ${m.delivered ? '✅ yes' : '— no'}`);
+      if (m.baseDropSummary) {
+        lines.push(`🪧 Base\\-drops: ${esc(m.baseDropSummary)}`);
+      }
+    } else {
+      lines.push('');
+      lines.push('_No scan has completed yet\\._');
+    }
+
+    if (s.lastDelivered) {
+      const d = s.lastDelivered;
+      const label = d.symbol ? `*${esc(d.symbol)}* ` : '';
+      lines.push('');
+      lines.push(`🏷️ Last delivered: ${label}\`${esc(d.mint)}\` \\(${esc(ageString(d.at))}\\)`);
+    }
+    if (s.lastError) {
+      lines.push('');
+      lines.push(`⚠️ Last error: ${esc(s.lastError.message)} \\(${esc(ageString(s.lastError.at))}\\)`);
+    }
+    return lines.join('\n');
+  }
+
   /** Async body of /scan: run one GMGN cycle, then follow up with the counts. */
-  async processScan(chatId: number): Promise<void> {
+  async processScan(chatId: number, replyTo?: number): Promise<void> {
     if (!this.gmgnScan) return;
     let summary: CycleSummary | null;
     try {
       summary = await this.gmgnScan();
     } catch (err) {
       console.error('[telegram] /scan failed:', err);
-      await this.sendDirect(chatId, 'GMGN scan failed; check the logs and try again later\\.');
+      await this.sendDirect(chatId, '❌ GMGN scan failed; check the logs and try again later\\.', replyTo);
       return;
     }
     if (summary === null) {
       await this.sendDirect(
         chatId,
         '⏳ A scan is already running — its results will arrive shortly\\.',
+        replyTo,
       );
       return;
     }
     const lines = [
       '🔎 *GMGN scan complete*',
-      `Trending: ${summary.trending}  ·  Quick\\-pass: ${summary.quickPass}`,
-      `Base\\-pass: ${summary.basePass}  ·  Deliverable: ${summary.deliverable}`,
+      '',
+      `📈 Trending: *${summary.trending}*  ·  ⚡ Quick\\-pass: *${summary.quickPass}*`,
+      `✅ Base\\-pass: *${summary.basePass}*  ·  📨 Deliverable: *${summary.deliverable}*`,
+      '',
       summary.fresh === 0
-        ? 'No new candidates \\(already alerted or none matched\\)\\.'
+        ? '😴 No new candidates \\(already alerted or none matched\\)\\.'
         : summary.delivered
-          ? `✅ Sent *${summary.fresh}* new alert\\(s\\)\\.`
+          ? `🚀 Sent *${summary.fresh}* new alert\\(s\\)\\.`
           : `⚠️ *${summary.fresh}* new candidate\\(s\\) found but delivery failed — will retry next cycle\\.`,
     ];
-    await this.sendDirect(chatId, lines.join('\n'));
+    // Surface why candidates dropped at the base filter, even when some passed.
+    if (summary.baseDropSummary) {
+      lines.push(`🪧 Base\\-drops: ${esc(summary.baseDropSummary)}`);
+    }
+    await this.sendDirect(chatId, lines.join('\n'), replyTo);
   }
 
-  /** Send a one-off MarkdownV2 message directly (command replies; not the alert queue). */
-  private async sendDirect(chatId: number, text: string): Promise<void> {
+  /**
+   * Reply to the message that triggered a command, threading the reply so the calling
+   * user is highlighted/notified (important in group chats). Falls back to a normal
+   * send if the original message id is unavailable.
+   */
+  private async replyTo(ctx: Context, text: string): Promise<void> {
+    const msgId = ctx.msgId;
+    await ctx.reply(text, {
+      parse_mode: 'MarkdownV2',
+      link_preview_options: { is_disabled: true },
+      ...(msgId !== undefined
+        ? { reply_parameters: { message_id: msgId, allow_sending_without_reply: true } }
+        : {}),
+    });
+  }
+
+  /**
+   * Send a one-off MarkdownV2 message directly (async command follow-ups; not the
+   * alert queue). When `replyToMessageId` is given the message is threaded as a reply
+   * to the user's command, so they get tagged in group chats.
+   */
+  private async sendDirect(chatId: number, text: string, replyToMessageId?: number): Promise<void> {
     try {
       await this.bot.api.sendMessage(chatId, text, {
         parse_mode: 'MarkdownV2',
         link_preview_options: { is_disabled: true },
+        ...(replyToMessageId !== undefined
+          ? { reply_parameters: { message_id: replyToMessageId, allow_sending_without_reply: true } }
+          : {}),
       });
     } catch (err) {
       console.error(`[telegram] reply to ${chatId} failed:`, err);
@@ -740,19 +921,20 @@ export class TelegramTransport {
   }
 
   /** Async body of /watch: verify on Jupiter, then persist + follow up. */
-  async processWatch(chatId: number, mint: string, threshold: number): Promise<void> {
+  async processWatch(chatId: number, mint: string, threshold: number, replyTo?: number): Promise<void> {
     let snap;
     try {
       snap = await this.monitor.snapshot(mint);
     } catch (err) {
       console.error(`[telegram] /watch snapshot ${mint} failed:`, err);
-      await this.sendDirect(chatId, 'Could not reach Jupiter to verify that token; try again later\\.');
+      await this.sendDirect(chatId, '⚠️ Could not reach Jupiter to verify that token — try again later\\.', replyTo);
       return;
     }
     if (!snap || !(snap.ath > 0)) {
       await this.sendDirect(
         chatId,
-        'No market data found for that mint — it was *not* added\\. Double\\-check the address\\.',
+        ['🔍 *No market data found*', '', 'That mint was *not* added — double\\-check the address\\.'].join('\n'),
+        replyTo,
       );
       return;
     }
@@ -762,57 +944,129 @@ export class TelegramTransport {
     // this rebases ATH + quote together (no stale-denomination corruption).
     this.store.updatePersistedAth(mint, snap.ath, this.cfg.quote);
 
-    const label = symbol ? `*${esc(symbol)}* ` : '';
+    const label = symbol ? `*${esc(symbol)}*  ` : '';
     await this.sendDirect(
       chatId,
-      `✅ Watching ${label}\`${esc(mint)}\` at *${esc(fmtPct(threshold))}%* drawdown\\.\n` +
-        `Current drawdown: ${esc(fmtPct(snap.drawdownPct))}%`,
+      [
+        `✅ *Watching* ${label}`,
+        `\`${esc(mint)}\``,
+        '',
+        `🎯 Alert at: *${esc(fmtPct(threshold))}%* drawdown`,
+        `📉 Current drawdown: *${esc(fmtPct(snap.drawdownPct))}%*`,
+      ].join('\n'),
+      replyTo,
     );
   }
 
   /** Async body of /status: fetch a snapshot, then follow up. */
-  async processStatus(chatId: number, mint: string): Promise<void> {
+  async processStatus(chatId: number, mint: string, replyTo?: number): Promise<void> {
     const entry = this.store.get(mint);
     let snap;
     try {
       snap = await this.monitor.snapshot(mint);
     } catch (err) {
       console.error('[telegram] /status failed:', err);
-      await this.sendDirect(chatId, 'Failed to fetch status, try again later\\.');
+      await this.sendDirect(chatId, '⚠️ Failed to fetch status — try again later\\.', replyTo);
       return;
     }
     if (!snap) {
-      await this.sendDirect(chatId, 'No data returned for that mint\\.');
+      await this.sendDirect(chatId, 'ℹ️ No data returned for that mint\\.', replyTo);
       return;
     }
     const quote = this.cfg.quote === 'usd' ? 'USD' : 'SOL';
     const lines = [
-      `*Status* \`${esc(mint)}\``,
-      `Price: ${esc(fmtPrice(snap.price))} ${quote}`,
-      `ATH \\(rolling\\): ${esc(fmtPrice(snap.ath))} ${quote}`,
-      `Drawdown: *${esc(fmtPct(snap.drawdownPct))}%*`,
+      '📊 *Status*',
+      `\`${esc(mint)}\``,
+      '',
+      `💰 Price: *${esc(fmtPrice(snap.price))}* ${quote}`,
+      `🏔 ATH \\(rolling\\): ${esc(fmtPrice(snap.ath))} ${quote}`,
+      `📉 Drawdown: *${esc(fmtPct(snap.drawdownPct))}%*`,
     ];
     if (entry) {
-      lines.push(`Threshold: ${esc(fmtPct(entry.threshold))}%  ·  State: ${entry.state}`);
+      const stateIcon = entry.state === 'TRIGGERED' ? '🔴' : '🟢';
+      lines.push('');
+      lines.push(`🎯 Threshold: ${esc(fmtPct(entry.threshold))}%  ·  ${stateIcon} ${entry.state}`);
       if (entry.lastCheckedAt) {
-        lines.push(`Last check: ${esc(ageString(entry.lastCheckedAt))}`);
+        lines.push(`🕒 Last check: ${esc(ageString(entry.lastCheckedAt))}`);
       }
     } else {
-      lines.push('_Not currently watched_\\.');
+      lines.push('');
+      lines.push('_Not currently watched\\._');
     }
     if (snap.stale) lines.push('⚠️ _Latest candle looks stale; data may be delayed_\\.');
-    await this.sendDirect(chatId, lines.join('\n'));
+    await this.sendDirect(chatId, lines.join('\n'), replyTo);
+  }
+
+  /**
+   * Async body of /check: render the full token card (same rich layout as an alert)
+   * for any mint on demand. Uses the Jupiter snapshot for price/ATH/drawdown and
+   * merges GMGN display fields + Meteora pools; best-effort, so partial data still shows.
+   */
+  async processCheck(chatId: number, mint: string, replyTo?: number): Promise<void> {
+    const [snap, { extra, pools }] = await Promise.all([
+      this.monitor.snapshot(mint).catch((err) => {
+        console.error(`[telegram] /check snapshot ${mint} failed:`, err);
+        return null;
+      }),
+      this.fetchEnrichment(mint),
+    ]);
+
+    // Prefer GMGN USD data so the card is internally consistent: USD price + USD
+    // market caps, and a drawdown computed from the USD ATH (matches the FDV ⇨ ATH
+    // projection). Fall back to the Jupiter snapshot only when GMGN has no price.
+    let priceUsd = extra.priceUsd;
+    let athUsd = extra.athUsd;
+    let drawdownPct: number | undefined;
+    let quote: 'native' | 'usd' = 'usd';
+    if (priceUsd !== undefined) {
+      if (athUsd !== undefined && athUsd > 0) {
+        drawdownPct = Math.max(0, ((athUsd - priceUsd) / athUsd) * 100);
+      } else if (snap) {
+        drawdownPct = snap.drawdownPct;
+      }
+    } else if (snap) {
+      priceUsd = snap.price;
+      athUsd = snap.ath;
+      drawdownPct = snap.drawdownPct;
+      quote = this.cfg.quote;
+    }
+
+    const hasAnything =
+      priceUsd !== undefined || pools.length > 0 || Object.keys(extra).length > 0;
+    if (!hasAnything) {
+      await this.sendDirect(
+        chatId,
+        ['🔍 *No data found*', '', `\`${esc(mint)}\``, '', 'Could not find market data for that mint\\.'].join('\n'),
+        replyTo,
+      );
+      return;
+    }
+
+    const view: RichTokenView = {
+      ...extra,
+      kind: 'check',
+      mint,
+      symbol: extra.symbol,
+      chain: 'Solana',
+      priceUsd,
+      athUsd,
+      drawdownPct,
+      meteoraPools: pools.length > 0 ? pools : undefined,
+      quote,
+    };
+    const messages = formatRichMessages([view]);
+    for (const m of messages) await this.sendDirect(chatId, m, replyTo);
   }
 
   /** Returns a MarkdownV2 error string if the threshold is invalid, else null. */
   private validateThreshold(pctStr: string): string | null {
     const pct = Number(pctStr);
     if (!Number.isFinite(pct) || pct <= 0 || pct > 100) {
-      return 'Threshold must be a number in \\(0, 100\\]\\.';
+      return '⚠️ Threshold must be a number in \\(0, 100\\]\\.';
     }
     if (pct <= this.cfg.recoveryHysteresisPct) {
       return (
-        `Threshold must be greater than the recovery hysteresis ` +
+        `⚠️ Threshold must be greater than the recovery hysteresis ` +
         `\\(${esc(fmtPct(this.cfg.recoveryHysteresisPct))}%\\), otherwise alerts can never re\\-arm\\.`
       );
     }
@@ -821,16 +1075,26 @@ export class TelegramTransport {
 }
 
 const HELP_TEXT = [
-  '*Commands*',
-  '/start — subscribe this chat to alerts',
-  '/stop — unsubscribe this chat from alerts',
-  '/watch `<mint>` `[pct]` — watch a token \\(verified on Jupiter first\\)',
-  '/unwatch `<mint>` — stop watching',
-  '/list — list watched tokens',
-  '/threshold `<mint|all>` `<pct>` — set drawdown threshold',
-  '/status `<mint>` — current price, rolling ATH and drawdown',
-  '/resetath `<mint>` — reset the stored ATH and re\\-arm',
-  '/scan — run a GMGN drawdown scan cycle now \\(if the scanner is enabled\\)',
-  '/testalert — preview an example alert \\(rendered for SOL\\)',
-  '/help — this message',
+  '🤖 *ATH Drawdown Bot — Commands*',
+  '',
+  '👀 *Watchlist*',
+  '   📈 /watch `<mint>` `[pct]` — watch a token \\(verified on Jupiter first\\)',
+  '   🗑️ /unwatch `<mint>` — stop watching',
+  '   📋 /list — list watched tokens',
+  '   🎯 /threshold `<mint|all>` `<pct>` — set drawdown threshold',
+  '   📊 /status `<mint>` — current price, rolling ATH and drawdown',
+  '   🔍 /check `<mint>` — full token card \\(market cap, holders, pools…\\)',
+  '   ♻️ /resetath `<mint>` — reset the stored ATH and re\\-arm',
+  '',
+  '🔎 *GMGN scanner*',
+  '   ⚡ /scan — run a drawdown scan cycle now',
+  '   📡 /gmgnstatus — show the last scan summary',
+  '',
+  '🔔 *Subscription*',
+  '   ✅ /start — subscribe this chat to alerts',
+  '   🔕 /stop — unsubscribe this chat',
+  '',
+  '🧪 *Misc*',
+  '   🖼️ /testalert — preview an example alert \\(rendered for SOL\\)',
+  '   ❓ /help — this message',
 ].join('\n');
