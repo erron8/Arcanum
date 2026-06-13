@@ -77,13 +77,19 @@ function shortAddr(a: string): string {
   return a.length > 8 ? `${a.slice(0, 4)}…${a.slice(-4)}` : a;
 }
 
+/** Compact number label (e.g. 1.2M, 340.0K). Returns undefined for absent/invalid. */
+function fmtCompact(n: number | undefined): string | undefined {
+  if (n === undefined || !Number.isFinite(n) || n < 0) return undefined;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return `${n.toFixed(0)}`;
+}
+
 /** Compact USD label (e.g. $1.2M, $340.0K). Returns undefined for absent/invalid. */
 function fmtUsd(n: number | undefined): string | undefined {
-  if (n === undefined || !Number.isFinite(n) || n < 0) return undefined;
-  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
-  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
-  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
-  return `$${n.toFixed(0)}`;
+  const s = fmtCompact(n);
+  return s !== undefined ? `$${s}` : undefined;
 }
 
 function fmtAge(hours: number | undefined): string | undefined {
@@ -126,12 +132,23 @@ function chartLinks(v: RichTokenView): string[] {
   return out.filter((x): x is string => x !== null);
 }
 
-/** Label a DLMM pool as "PAIR binStep/baseFee%" when the config is known, else just PAIR. */
-function meteoraPoolLabel(p: MeteoraPoolLink): string {
+/**
+ * Render one Meteora pool as `[<token>/<quote> binStep/baseFee%](url) | TVL : 14.5K`.
+ * The pair + config is the hyperlink; the TVL follows as plain text. The base side is
+ * the token being shown (`baseSymbol`), so DBC pools where Meteora omits the base
+ * symbol still read correctly. Bin-step/fee and the TVL suffix are omitted when unknown.
+ */
+function meteoraEntry(p: MeteoraPoolLink, baseSymbol: string): string | null {
+  const dest = safeLinkDest(p.url);
+  if (!dest) return null;
+  let label = `${baseSymbol}/${p.quoteSymbol ?? '?'}`;
   if (p.binStep !== undefined && p.baseFeePct !== undefined) {
-    return `${p.pair} ${p.binStep}/${p.baseFeePct}%`;
+    label += ` ${p.binStep}/${p.baseFeePct}%`;
   }
-  return p.pair;
+  let entry = `[${esc(label)}](${dest})`;
+  const tvl = fmtCompact(p.tvl);
+  if (tvl) entry += ` \\| TVL : ${esc(tvl)}`;
+  return entry;
 }
 
 function socialLinks(v: RichTokenView): string[] {
@@ -253,8 +270,9 @@ export function formatRichBlock(v: RichTokenView): string {
   // --- Meteora DLMM pools as a numbered list (top pools by TVL) ---
   const meteora: string[] = [];
   if (v.meteoraPools && v.meteoraPools.length > 0) {
+    const baseSymbol = v.symbol ?? shortMint(v.mint);
     const entries = v.meteoraPools
-      .map((p) => link(meteoraPoolLabel(p), p.url))
+      .map((p) => meteoraEntry(p, baseSymbol))
       .filter((s): s is string => s !== null);
     if (entries.length > 0) {
       meteora.push('🌊 Meteora pools:');

@@ -474,7 +474,7 @@ describe('TelegramTransport commands (real handler path)', () => {
   test('/testalert previews both alert styles with live Meteora links', async () => {
     const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
     bot.setMeteoraLinker(async () => [
-      { poolAddress: 'P1', pair: 'SOL/USDC', url: 'https://app.meteora.ag/dlmm/P1' },
+      { poolAddress: 'P1', quoteSymbol: 'USDC', url: 'https://app.meteora.ag/dlmm/P1' },
     ]);
     const sent = recorder(bot);
     await bot.handleUpdate(cmdUpdate(7, '/testalert'));
@@ -507,7 +507,7 @@ describe('TelegramTransport commands (real handler path)', () => {
       holderCount: 4321,
     }));
     bot.setMeteoraLinker(async () => [
-      { poolAddress: 'P1', pair: 'WIF/SOL', binStep: 80, baseFeePct: 0.8, url: 'https://app.meteora.ag/dlmm/P1' },
+      { poolAddress: 'P1', quoteSymbol: 'SOL', binStep: 80, baseFeePct: 0.8, url: 'https://app.meteora.ag/dlmm/P1' },
     ]);
     const sent = recorder(bot);
     await bot.handleUpdate(cmdUpdate(7, `/check ${MINT}`));

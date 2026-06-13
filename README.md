@@ -1,9 +1,20 @@
 # ATH Drawdown Indicator + Telegram Alerting Bot
 
-TypeScript (strict) · Bun · grammY · JSON-file persistence · Jupiter datapi.
+TypeScript (strict) · Bun · grammY · JSON-file persistence · Jupiter datapi · GMGN
+OpenAPI · Meteora DLMM Data API.
 
-Computes a **rolling/windowed** all-time-high (ATH) and percent drawdown for Solana
-tokens and sends a Telegram alert when a watched token falls a configurable % below it.
+A Telegram bot for Solana tokens, built around all-time-high (ATH) drawdown. It does
+three things:
+
+1. **Watchlist alerts** — `/watch` a mint and get a Telegram alert the moment it falls a
+   configurable % below its rolling ATH (the core feature).
+2. **GMGN drawdown scanner** *(optional)* — a cron that finds coins deep in drawdown but
+   still alive, runs a security/holders/volume screening, and alerts on the survivors.
+3. **On-demand token cards** — `/check <mint>` renders the same rich card for any token
+   right now, without adding it to the watchlist.
+
+Alerts and cards use a shared rich layout enriched with GMGN market data and Meteora
+DLMM pool links (see [Alert / card layout](#alert--card-layout)).
 
 > **ATH semantics (important):** the "ATH" is the highest of (a) the highest price in
 > the fetched lookback window — by default the **last 1000 daily candles** (`ATH_WINDOW`
@@ -21,17 +32,23 @@ src/
   utils/selfcheck.ts     # verification self-check
   fetchers/chartData.ts  # Jupiter datapi → candles + indicators
   alerts/
-    config.ts            # env-overridable tunables
+    config.ts            # env-overridable tunables (watch, GMGN, Meteora)
     store.ts             # atomic, debounced JSON persistence
     athMonitor.ts        # poll loop + ARMED/TRIGGERED state machine (transport-agnostic)
-    telegramBot.ts       # grammY transport + commands + generic notify()
+    telegramBot.ts       # grammY transport: commands, command menu, reply-threading,
+                         #   /watch + /check enrichment, generic notify()
+    richFormat.ts        # shared rich MarkdownV2 renderer (watch / GMGN / check cards)
+    format.ts            # MarkdownV2 escaping + number/price helpers
     index.ts             # bootstrap + graceful shutdown
-  gmgn/                  # optional GMGN drawdown scanner (disabled by default)
+  gmgn/                  # optional GMGN drawdown scanner + on-demand enrichment
     client.ts            # GMGN OpenAPI client (auth, retries; injectable fetch)
     types.ts             # GMGN response types
-    scanner.ts           # base filter + screening workflow + cron loop
-    format.ts            # MarkdownV2 screening-alert rendering
+    scanner.ts           # base filter + screening workflow + cron loop + buildGmgnDisplay
+    enrich.ts            # token-info → display fields, used by /watch and /check
     store.ts             # dedupe store (./data/gmgn-screened.json)
+    dryrun.ts            # `bun run gmgn:dryrun` — one safe scan, no Telegram, no secrets
+  meteora/
+    client.ts            # Meteora DLMM Data API client → pool links (pair, fee, TVL)
 ```
 
 ## Setup
@@ -147,6 +164,13 @@ people issue commands at once.
 | `GMGN_DEDUPE_MS` | 86400000 | Don't re-alert a mint within this window. |
 | `GMGN_AUTO_WATCH` | false | Also add passing mints to `/watch` at threshold 50. |
 | `GMGN_SCREENED_PATH` | ./data/gmgn-screened.json | Dedupe store path (gitignored). |
+| `METEORA_LINKS_ENABLED` | true | Add Meteora DLMM pool links to cards (public API, no key). |
+| `METEORA_MAX_POOLS` | 5 | Pool links shown per card, top by TVL ([1, 10]). |
+| `METEORA_BASE_URL` | https://dlmm.datapi.meteora.ag | Override Meteora DLMM Data API base URL (mainly for tests). |
+
+> A `GMGN_API_KEY` enables GMGN enrichment for **`/watch` and `/check`** even when the
+> scanner itself is disabled (`GMGN_SCAN_ENABLED=false`). Without a key, those fall back
+> to the basic Jupiter price/ATH view. Meteora links work with no key at all.
 
 > Prices are **SOL-denominated** by default (`quote=native`). Set `QUOTE=usd` for USD.
 > Jupiter `time` is in seconds (converted to ms internally). Invalid env values
@@ -231,27 +255,68 @@ Safety & robustness:
   API and prints rank/quick-pass/base-pass/security-fail/deliverable counts plus a few
   example candidates. It never sends Telegram alerts and never prints secrets.
 
-## Alert layout
+## Alert / card layout
 
-Both the `/watch` drawdown alerts and the GMGN screening alerts share one rich,
-scanner-style MarkdownV2 layout (`src/alerts/richFormat.ts`): name + `$TICKER` with a
-drawdown/verdict tag, chain @ launchpad, price, FDV now ⇨ at-ATH, liquidity (+ FDV/liq
-ratio), volume, 1H volume + change, top-holder amounts (each linking to Solscan),
-holder count + bundled %, a smart-money/KOL summary, socials, chart/explorer links,
-**Meteora DLMM pool links** (top pools by TVL, labeled `PAIR binStep/baseFee%`), the
-contract address, and a row of quick-buy trading-bot deeplinks (**no referral codes**).
+The `/watch` drawdown alert, the GMGN screening alert, and the `/check` card all share
+**one** rich MarkdownV2 renderer (`src/alerts/richFormat.ts`). Lines are grouped into
+sections separated by a blank line so the message is easy to scan:
 
-Meteora links come from the public DLMM Data API (`src/meteora/client.ts`, no key);
-they're enabled by default (`METEORA_LINKS_ENABLED`, `METEORA_MAX_POOLS` — top 5 by
-TVL) and fetched best-effort at delivery time, so a Meteora outage never blocks an
-alert.
+```
+🔻 drooling cat  [$1.38M]  [⬇️50.31%]  $DROOLING      ← title (see below)
 
-Every field is best-effort — anything missing is simply omitted, so the same renderer
-works whether it has a full GMGN payload or only a price/ATH. GMGN screening alerts are
-fully populated from the scan. `/watch` alerts carry the Jupiter price/ATH/drawdown and
-threshold, and are **enriched** with the GMGN fields (market cap, liquidity, holders,
-etc.) whenever `GMGN_API_KEY` is set — enrichment is best-effort and failures fall back
-to the basic view, so `/watch` never breaks if GMGN is down or unconfigured.
+🏔 ATH: $2.76M                                        ← market cap at ATH (bold)
+
+🌐 Solana @ Pump.fun                                  ← chain @ launchpad
+💰 USD: 0.00137138                                    ← price (USD)
+💎 FDV: $1.38M ⇨ $2.76M                               ← market cap now ⇨ at ATH
+💦 Liq: $102.2K  [x13.4]                              ← liquidity (+ FDV/liq ratio)
+📊 Vol: $1.38M  ·  Age: 15.0d                         ← 24h volume + token age
+
+👥 TH: 3.7 · 3.3 · 2.9 · 2.7 · 2.3  [top10 23%]       ← top holders (each → Solscan)
+🤝 Holders: 1983
+🧠 SM holding 1 · KOL 3 · SM exited 2 · SM unreal+ 1  ← smart-money / KOL summary
+⚠️ <warnings>                                         ← GMGN WARN reasons (if any)
+
+🌐 Web · 🐦 X · 💬 TG                                  ← socials (when known)
+📈 DEX · Birdeye · GMGN · Solscan · Pump              ← chart / explorer links
+
+🌊 Meteora pools:                                     ← top pools by TVL, numbered
+1. drooling/SOL 100/2% | TVL : 32.3K
+2. drooling/USDC 20/2% | TVL : 1.4K
+
+BcHEaa…pump                                           ← contract address (tap to copy)
+```
+
+Title anatomy: `<emoji> <name> [<mcap>] [⬇<drawdown%> · <verdict|threshold>] $TICKER`
+
+- **emoji** — `🔻` watch alert · `🔎`/`✅`/`⚠️`/`⛔` GMGN (verdict) · `🔍` `/check`.
+- **name** is a hyperlink to the token's **GMGN page** (`gmgn.ai/sol/token/<mint>`).
+- **`[mcap]`**, the **drawdown %**, and the **ATH** value are **bold**.
+- the tag shows `threshold N%` for `/watch`, or the GMGN `PASS/WARN/FAIL` verdict.
+- **`$TICKER`** is appended as a plain-text **cashtag** (uppercased). Telegram makes
+  cashtags tappable and tapping one **searches the chat** for that ticker. Note: this
+  only works for tickers that are **1–8 letters with no digits** (a Telegram rule), so
+  e.g. `$AMERICA250` shows but isn't tap-to-search.
+
+Meteora pool lines are `[<token>/<quote> binStep/baseFee%](pool-url) | TVL : <value>`.
+The base side is always the token being shown, so DBC pools where Meteora omits the
+token's symbol still read correctly (e.g. `AMERICA250/USDC`, not `-USDC`).
+
+**Data sources & resilience.** Every field is best-effort — anything missing is simply
+omitted, so the same renderer works with a full GMGN payload or only a price/ATH:
+
+- **GMGN screening alerts** are fully populated from the scan.
+- **`/check`** prefers GMGN USD data (price, market caps) so the card is internally
+  consistent, falling back to the Jupiter snapshot only when GMGN has no price.
+- **`/watch` alerts** carry the Jupiter price/ATH/drawdown + threshold, and are
+  **enriched** with GMGN fields (market cap, liquidity, holders…) whenever a
+  `GMGN_API_KEY` is set. Enrichment + Meteora are each bounded by a short timeout
+  (~2.5s) and fall back to the basic view, so a slow/missing upstream never delays or
+  breaks a `/watch` alert.
+
+**Meteora links** come from the public DLMM Data API (`src/meteora/client.ts`, no key);
+enabled by default (`METEORA_LINKS_ENABLED`, `METEORA_MAX_POOLS` — top 5 by TVL) and
+fetched best-effort at delivery time.
 
 ## Delivery & lifecycle
 
@@ -280,8 +345,11 @@ to the basic view, so `/watch` never breaks if GMGN is down or unconfigured.
 ```bash
 bun run typecheck    # tsc --noEmit (strict) — must pass
 bun run selfcheck    # prints PASS for calculateATHDrawdown sample
-bun test             # unit + integration tests (indicators, store, monitor, config,
-                     #   format, auth, and Telegram commands/delivery with a mocked API)
+bun test             # unit + integration tests (indicators, store, monitor, config, auth,
+                     #   rich renderer, GMGN client/scanner, Meteora client, and Telegram
+                     #   commands/delivery with a mocked API)
+bun run gmgn:dryrun  # one real GMGN scan, counts + examples; no Telegram, no secrets
+                     #   (requires GMGN_API_KEY)
 ```
 
 Self-check: `calculateATHDrawdown([1,2,3,2,1.5],[1,2,3,2,1.5])`
@@ -290,6 +358,13 @@ Self-check: `calculateATHDrawdown([1,2,3,2,1.5],[1,2,3,2,1.5])`
 Live check: `/watch` a token, set `/threshold` just above the current drawdown
 (no alert), then lower it below (exactly **one** alert); confirm cooldown +
 recovery re-arms it.
+
+Telegram smoke test after deploy:
+
+1. Send `/testalert` and confirm both example cards render without Telegram parse errors.
+2. Send `/check <mint>` for a live Solana token and confirm the GMGN link, cashtag,
+   Meteora pool labels, and contract line are readable.
+3. Send `/scan`, then `/gmgnstatus`; confirm the reported counts match the process logs.
 
 ## Publishing to GitHub
 

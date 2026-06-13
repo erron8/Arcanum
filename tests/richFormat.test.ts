@@ -91,49 +91,56 @@ describe('formatRichBlock — GMGN', () => {
     expect(b).toContain('https://solscan.io/account/BNEnz1YtUQWH3bRtGaGjipPxHagWLeR8YjFQWmtG3JhJ');
   });
 
-  test('renders Meteora pool links labeled PAIR binStep/baseFee%', () => {
+  test('renders Meteora pools as <token>/<quote> binStep/baseFee% with bold TVL', () => {
+    // gmgnView symbol is WIF → base side of every pool is WIF.
     const b = formatRichBlock(
       gmgnView({
         meteoraPools: [
           {
             poolAddress: 'POOL1',
-            pair: 'SOL/USDC',
+            quoteSymbol: 'USDC',
             binStep: 4,
             baseFeePct: 0.04,
+            tvl: 45_600,
             url: 'https://app.meteora.ag/dlmm/POOL1',
           },
         ],
       }),
     );
     expect(b).toContain('🌊 Meteora pools:');
-    // Numbered list entry; "." in 0.04 and in "1." are MarkdownV2-escaped.
-    expect(b).toContain('1\\. [SOL/USDC 4/0\\.04%](https://app.meteora.ag/dlmm/POOL1)');
+    // Pair+config is the link; TVL follows as "| TVL : 45.6K" plain text. "." and "|" escaped.
+    expect(b).toContain(
+      '1\\. [WIF/USDC 4/0\\.04%](https://app.meteora.ag/dlmm/POOL1) \\| TVL : 45\\.6K',
+    );
   });
 
   test('Meteora pools render as a numbered list, one per line', () => {
     const b = formatRichBlock(
       gmgnView({
         meteoraPools: [
-          { poolAddress: 'P1', pair: 'A/SOL', binStep: 4, baseFeePct: 0.04, url: 'https://app.meteora.ag/dlmm/P1' },
-          { poolAddress: 'P2', pair: 'A/USDC', binStep: 20, baseFeePct: 0.2, url: 'https://app.meteora.ag/dlmm/P2' },
+          { poolAddress: 'P1', quoteSymbol: 'SOL', binStep: 4, baseFeePct: 0.04, url: 'https://app.meteora.ag/dlmm/P1' },
+          { poolAddress: 'P2', quoteSymbol: 'USDC', binStep: 20, baseFeePct: 0.2, url: 'https://app.meteora.ag/dlmm/P2' },
         ],
       }),
     );
-    expect(b).toContain('1\\. [A/SOL 4/0\\.04%]');
-    expect(b).toContain('2\\. [A/USDC 20/0\\.2%]');
+    expect(b).toContain('1\\. [WIF/SOL 4/0\\.04%]');
+    expect(b).toContain('2\\. [WIF/USDC 20/0\\.2%]');
     // Each entry is on its own line.
-    expect(b).toMatch(/1\\\. \[A\/SOL[^\n]*\n2\\\. \[A\/USDC/);
+    expect(b).toMatch(/1\\\. \[WIF\/SOL[^\n]*\n2\\\. \[WIF\/USDC/);
   });
 
-  test('Meteora label falls back to just the pair when config is missing', () => {
+  test('Meteora label uses the token symbol even when Meteora omits the base symbol', () => {
+    // DBC tokens: Meteora has no base symbol — the renderer still shows <token>/<quote>.
     const b = formatRichBlock(
       gmgnView({
+        symbol: 'AMERICA250',
         meteoraPools: [
-          { poolAddress: 'POOL1', pair: 'SOL/WIF', url: 'https://app.meteora.ag/dlmm/POOL1' },
+          { poolAddress: 'POOL1', quoteSymbol: 'USDC', binStep: 125, baseFeePct: 1.5, url: 'https://app.meteora.ag/dlmm/POOL1' },
         ],
       }),
     );
-    expect(b).toContain('[SOL/WIF](https://app.meteora.ag/dlmm/POOL1)');
+    expect(b).toContain('[AMERICA250/USDC 125/1\\.5%]'); // not "-USDC"
+    expect(b).not.toContain('\\-USDC');
   });
 
   test('omits fields that are absent (no crash, no doubled blank lines)', () => {

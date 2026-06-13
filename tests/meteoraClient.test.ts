@@ -80,17 +80,35 @@ describe('MeteoraClient.getPoolsByMint', () => {
     expect(pools.map((p) => p.poolAddress)).toEqual(['D', 'B', 'C']);
   });
 
-  test('maps pair, url, metrics and pool config (bin step + base fee)', async () => {
+  test('maps quote symbol, url, metrics and pool config (bin step + base fee)', async () => {
     const { fetch } = stub([
       res({ data: [pool({ address: 'POOLX', pool_config: { bin_step: 4, base_fee_pct: 0.04 } })] }),
     ]);
     const [p] = await client(fetch).getPoolsByMint(MINT);
-    expect(p!.pair).toBe('SOL/WIF');
+    // MINT is token_x here, so the quote side is token_y (WIF).
+    expect(p!.quoteSymbol).toBe('WIF');
     expect(p!.url).toBe(meteoraPoolUrl('POOLX'));
     expect(p!.volume24h).toBe(50000);
     expect(p!.tvl).toBe(100000);
     expect(p!.binStep).toBe(4);
     expect(p!.baseFeePct).toBe(0.04);
+  });
+
+  test('uses the non-mint side as the quote, even when the base symbol is missing', async () => {
+    // DBC-style: our token (token_x = MINT) has no symbol; quote (token_y) is USDC.
+    const { fetch } = stub([
+      res({
+        data: [
+          pool({
+            address: 'POOLY',
+            token_x: { address: MINT, symbol: '' },
+            token_y: { address: 'usdcMint', symbol: 'USDC' },
+          }),
+        ],
+      }),
+    ]);
+    const [p] = await client(fetch).getPoolsByMint(MINT);
+    expect(p!.quoteSymbol).toBe('USDC');
   });
 
   test('falls back to strict token_x/token_y search when broad search has no match', async () => {

@@ -14,7 +14,12 @@ export function meteoraPoolUrl(poolAddress: string): string {
 /** Compact pool info surfaced in alerts. */
 export interface MeteoraPoolLink {
   poolAddress: string;
-  pair: string; // e.g. "SOL/USDC"
+  /**
+   * Symbol of the OTHER side of the pair (the quote — SOL/USDC/etc.). The base side is
+   * always the token being looked up, so the renderer labels pools as `<token>/<quote>`
+   * (Meteora sometimes omits the base token's symbol, e.g. for DBC pools).
+   */
+  quoteSymbol?: string;
   volume24h?: number;
   tvl?: number;
   /** DLMM bin step (price granularity). */
@@ -129,7 +134,7 @@ export class MeteoraClient {
     }
 
     return matched
-      .map((p) => toLink(p))
+      .map((p) => toLink(p, m))
       .filter((p): p is MeteoraPoolLink => p !== null)
       .sort((a, b) => (b.tvl ?? 0) - (a.tvl ?? 0))
       .slice(0, this.maxPools);
@@ -178,14 +183,20 @@ function matchesMint(p: MeteoraPoolRow, mint: string): boolean {
   return p.token_x?.address === mint || p.token_y?.address === mint;
 }
 
-function toLink(p: MeteoraPoolRow): MeteoraPoolLink | null {
+function shortAddr(a: string): string {
+  return a.length > 8 ? `${a.slice(0, 4)}…${a.slice(-4)}` : a;
+}
+
+function toLink(p: MeteoraPoolRow, mint: string): MeteoraPoolLink | null {
   if (!p.address) return null;
-  const xs = p.token_x?.symbol;
-  const ys = p.token_y?.symbol;
-  const pair = xs && ys ? `${xs}/${ys}` : (p.name ?? p.address);
+  // The quote side is whichever side ISN'T the token we looked up; its symbol is
+  // usually reliable (SOL/USDC) even when Meteora omits the base token's symbol.
+  const quoteSide = p.token_x?.address === mint ? p.token_y : p.token_x;
+  const quoteSymbol =
+    quoteSide?.symbol || (quoteSide?.address ? shortAddr(quoteSide.address) : undefined);
   return {
     poolAddress: p.address,
-    pair,
+    quoteSymbol,
     volume24h: toNum(p.volume?.['24h']),
     tvl: toNum(p.tvl),
     binStep: toNum(p.pool_config?.bin_step),
