@@ -90,6 +90,8 @@ pruned on startup and never receive alerts.
 | `/threshold <mint\|all> <pct>` | Set drawdown threshold (must be > hysteresis) |
 | `/status <mint>` | Current price, rolling ATH and drawdown |
 | `/resetath <mint>` | Reset stored ATH and re-arm |
+| `/scan` | Run a GMGN drawdown scan cycle now (only when the scanner is enabled) |
+| `/testalert` | Preview an example alert (rendered for SOL) without waiting for a real trigger |
 | `/help` | Show help |
 
 Mints must be base58, 32–44 chars; malformed mints are rejected with a clear reply.
@@ -189,13 +191,11 @@ scanner:
    `top_10_holder_rate > 0.50`, `creator_hold`, `sniper_count > 20`,
    `bundler_trader_amount_rate > 0.40`) yield a **FAIL** verdict and are **blocked**;
    mid-band values become **WARN**; clean tokens are **PASS**.
-4. **Alert** — `PASS`/`WARN` candidates are sent as compact MarkdownV2 messages
-   (symbol, mint, price, market cap, fees, age, ATH, drawdown %, verdict, key
-   warnings, smart-money/KOL summary, GMGN/Jupiter/Birdeye links) via the same
-   authorized-subscriber + retry path as drawdown alerts (`bot.notify`). Each mint is
-   recorded in `./data/gmgn-screened.json` so it isn't re-alerted within
-   `GMGN_DEDUPE_MS` (default 24h). Delivery is recorded only after a subscriber
-   actually receives it, so an undelivered batch retries next cycle.
+4. **Alert** — `PASS`/`WARN` candidates are sent in the shared **rich layout**
+   (see below) via the same authorized-subscriber + retry path as drawdown alerts
+   (`bot.notify`). Each mint is recorded in `./data/gmgn-screened.json` so it isn't
+   re-alerted within `GMGN_DEDUPE_MS` (default 24h). Delivery is recorded only after a
+   subscriber actually receives it, so an undelivered batch retries next cycle.
 
 Safety & robustness:
 
@@ -207,6 +207,32 @@ Safety & robustness:
   failure never aborts the scan cycle; overlapping cycles are skipped and logged.
 - **Optional auto-watch** — with `GMGN_AUTO_WATCH=true`, passing mints are also added
   to the `/watch` store at threshold 50 (default **false**).
+- **Manual trigger** — send `/scan` in Telegram to run one cycle on demand instead of
+  waiting for the interval. It reuses the same overlap guard (replies "already running"
+  if a cycle is in flight) and reports the cycle counts (trending → quick-pass →
+  base-pass → deliverable → new alerts).
+
+## Alert layout
+
+Both the `/watch` drawdown alerts and the GMGN screening alerts share one rich,
+scanner-style MarkdownV2 layout (`src/alerts/richFormat.ts`): name + `$TICKER` with a
+drawdown/verdict tag, chain @ launchpad, price, FDV now ⇨ at-ATH, liquidity (+ FDV/liq
+ratio), volume, 1H volume + change, top-holder amounts (each linking to Solscan),
+holder count + bundled %, a smart-money/KOL summary, socials, chart/explorer links,
+**Meteora DLMM pool links** (top pools by TVL, labeled `PAIR binStep/baseFee%`), the
+contract address, and a row of quick-buy trading-bot deeplinks (**no referral codes**).
+
+Meteora links come from the public DLMM Data API (`src/meteora/client.ts`, no key);
+they're enabled by default (`METEORA_LINKS_ENABLED`, `METEORA_MAX_POOLS` — top 5 by
+TVL) and fetched best-effort at delivery time, so a Meteora outage never blocks an
+alert.
+
+Every field is best-effort — anything missing is simply omitted, so the same renderer
+works whether it has a full GMGN payload or only a price/ATH. GMGN screening alerts are
+fully populated from the scan. `/watch` alerts carry the Jupiter price/ATH/drawdown and
+threshold, and are **enriched** with the GMGN fields (market cap, liquidity, holders,
+etc.) whenever `GMGN_API_KEY` is set — enrichment is best-effort and failures fall back
+to the basic view, so `/watch` never breaks if GMGN is down or unconfigured.
 
 ## Delivery & lifecycle
 

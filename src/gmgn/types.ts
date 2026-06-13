@@ -32,17 +32,23 @@ export interface GmgnRankItem {
   creation_timestamp?: number;
 }
 
+/**
+ * A price field that GMGN sometimes returns as a scalar and sometimes as a nested
+ * object (`{ price: "0.00041", ... }`). Read it via `infoPrice()` in the scanner.
+ */
+export type GmgnPriceField = number | string | { price?: number | string };
+
 /** Subset of `GET /v1/token/info` (`data`). */
 export interface GmgnTokenInfo {
   address?: string;
   symbol?: string;
   name?: string;
-  price?: number | string;
+  price?: GmgnPriceField;
   circulating_supply?: number | string;
   total_supply?: number | string;
   liquidity?: number | string;
   holder_count?: number;
-  ath_price?: number | string;
+  ath_price?: GmgnPriceField;
   market_cap?: number | string;
   trade_fee?: number | string;
   total_fee?: number | string;

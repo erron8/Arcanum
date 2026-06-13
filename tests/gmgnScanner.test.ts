@@ -10,6 +10,9 @@ import {
   quickFilterRank,
   baseFilter,
   athFromKline,
+  infoPrice,
+  summarizeReasons,
+  buildGmgnDisplay,
   screenSecurity,
   extractSmartMoney,
   analyzeVolume,
@@ -125,6 +128,119 @@ describe('baseFilter', () => {
     const r = baseFilter({ ...passing, ath_price: undefined }, cfg, { nowMs: NOW });
     expect(r.pass).toBe(false);
     expect(r.reasons.some((x) => x.includes('ATH'))).toBe(true);
+  });
+
+  test('handles the live nested-object price/ath shape (regression)', () => {
+    // Live token/info returns price (and ath_price) as `{ price: "..." }`, not a
+    // scalar. Before normalization this parsed to 0 → market_cap 0 → every drop.
+    const live: GmgnTokenInfo = {
+      total_fee: 50,
+      // No explicit market_cap; must derive from price × circulating_supply.
+      market_cap: undefined,
+      circulating_supply: '999959356',
+      price: { price: '0.00041331368' } as GmgnTokenInfo['price'],
+      ath_price: { price: '0.0011' } as GmgnTokenInfo['ath_price'],
+      open_timestamp: openedAt,
+    };
+    const r = baseFilter(live, cfg, { nowMs: NOW });
+    expect(r.price).toBeCloseTo(0.00041331368, 10);
+    expect(r.marketCap).toBeGreaterThan(250_000); // ~413k
+    expect(Math.round(r.drawdownPct)).toBe(62); // (0.0011 - 0.000413) / 0.0011
+    expect(r.pass).toBe(true);
+  });
+
+  test('falls back to the rank-row market cap when info omits it', () => {
+    const r = baseFilter(
+      { ...passing, market_cap: undefined, circulating_supply: undefined },
+      cfg,
+      { nowMs: NOW, fallbackMarketCap: 400_000 },
+    );
+    expect(r.marketCap).toBe(400_000);
+    expect(r.pass).toBe(true);
+  });
+});
+
+describe('infoPrice', () => {
+  test('reads scalar, string, and nested-object forms', () => {
+    expect(infoPrice(0.5)).toBe(0.5);
+    expect(infoPrice('0.5')).toBe(0.5);
+    expect(infoPrice({ price: '0.00041331368' })).toBeCloseTo(0.00041331368, 10);
+    expect(infoPrice({ price: 0.5 })).toBe(0.5);
+  });
+  test('returns undefined for missing / unparseable values', () => {
+    expect(infoPrice(undefined)).toBeUndefined();
+    expect(infoPrice(null)).toBeUndefined();
+    expect(infoPrice({})).toBeUndefined();
+    expect(infoPrice('not-a-number')).toBeUndefined();
+  });
+});
+
+describe('summarizeReasons', () => {
+  test('buckets by leading keyword and counts, most-frequent first', () => {
+    const out = summarizeReasons([
+      'market_cap 0 < 250000 USD',
+      'market_cap 0 < 250000 USD',
+      'drawdown 12.3% < 50%',
+    ]);
+    expect(out).toBe('market_cap×2, drawdown×1');
+  });
+  test('empty input yields an empty string', () => {
+    expect(summarizeReasons([])).toBe('');
+  });
+});
+
+describe('buildGmgnDisplay', () => {
+  test('maps info/security/holders into rich-view display fields', () => {
+    const view = buildGmgnDisplay({
+      info: {
+        symbol: 'WIF',
+        name: 'dogwifhat',
+        launchpad_platform: 'pump',
+        price: { price: '0.0004' } as GmgnTokenInfo['price'],
+        circulating_supply: '1000000000',
+        ath_price: '0.001',
+        liquidity: '120000',
+        holder_count: 4321,
+        stat: { top_10_holder_rate: 0.14 },
+        link: { website: 'https://wif.xyz', twitter_username: 'wif' },
+      },
+      security: { bundler_trader_amount_rate: 0.05 },
+      holders: [
+        { address: 'AAA', amount_percentage: 0.02, tags: ['smart_degen'], end_holding_at: null },
+        { address: 'BBB', amount_percentage: 0.017 },
+      ],
+      traders: [],
+      recentKline: [
+        { open: '0.0005', close: '0.0004', volume: '1000' },
+        { open: '0.0004', close: '0.00041', volume: '2000' },
+      ],
+      rankVolume: 4_700_000,
+    });
+    expect(view.symbol).toBe('WIF');
+    expect(view.platform).toBe('Pump'); // title-cased
+    expect(view.priceUsd).toBeCloseTo(0.0004, 10);
+    expect(view.fdvUsd).toBeCloseTo(400_000, 0); // price × supply
+    expect(view.fdvAthUsd).toBeCloseTo(1_000_000, 0); // ath × supply
+    expect(view.liquidityUsd).toBe(120_000);
+    expect(view.volumeUsd).toBe(4_700_000);
+    expect(view.vol1hUsd).toBe(3000); // summed kline volume
+    expect(view.top10Pct).toBeCloseTo(14, 5); // 0.14 → 14%
+    expect(view.bundledPct).toBeCloseTo(5, 5); // 0.05 → 5%
+    expect(view.topHolders?.[0]).toEqual({ address: 'AAA', pct: 2 });
+    expect(view.holderCount).toBe(4321);
+    expect(view.smartMoney?.smHolding).toBe(1);
+    expect(view.socials?.twitter).toBe('https://x.com/wif');
+  });
+
+  test('prefers pre-computed base values over raw info', () => {
+    const view = buildGmgnDisplay({
+      info: { price: { price: '0.0004' } as GmgnTokenInfo['price'] },
+      base: { price: 0.0009, marketCap: 555_000, drawdownPct: 70, ageHours: 30 },
+    });
+    expect(view.priceUsd).toBe(0.0009);
+    expect(view.fdvUsd).toBe(555_000);
+    expect(view.drawdownPct).toBe(70);
+    expect(view.ageHours).toBe(30);
   });
 });
 
@@ -388,6 +504,22 @@ describe('GmgnScanner.scanOnce', () => {
     expect(sent.length).toBe(1);
     expect(sent[0]![0]).toContain('GMGN Screening');
     expect(store.wasRecentlyAlerted('MINT1', gcfg().dedupeMs)).toBe(true);
+  });
+
+  test('scanNow returns a cycle summary with delivery counts', async () => {
+    const store = await newScreenedStore();
+    const scanner = new GmgnScanner(gcfg(), {
+      client: makeClient(passingRoutes()),
+      store,
+      notify: async () => true,
+      now: () => NOW,
+    });
+    const summary = await scanner.scanNow();
+    expect(summary).not.toBeNull();
+    expect(summary!.basePass).toBe(1);
+    expect(summary!.deliverable).toBe(1);
+    expect(summary!.fresh).toBe(1);
+    expect(summary!.delivered).toBe(true);
   });
 
   test('hard-fail candidate is blocked (no alert)', async () => {

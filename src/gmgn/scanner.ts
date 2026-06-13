@@ -2,7 +2,9 @@ import type { GmgnConfig } from '../alerts/config';
 import type { AlertStore } from '../alerts/store';
 import { GmgnClient, toNum } from './client';
 import { GmgnScreenedStore } from './store';
-import { formatCandidates } from './format';
+import { formatRichMessages } from '../alerts/richFormat';
+import type { RichTokenView } from '../alerts/richFormat';
+import type { MeteoraLinker } from '../meteora/client';
 import type {
   GmgnKlineCandle,
   GmgnRankItem,
@@ -32,6 +34,8 @@ export interface ScreenedCandidate {
   warnings: string[];
   smartMoney: SmartMoneySummary;
   links: { gmgn?: string; jupiter?: string; birdeye?: string };
+  /** Pre-built rich layout view used for the Telegram alert. */
+  view: RichTokenView;
 }
 
 // --- candidate source quick filter ----------------------------------------
@@ -66,6 +70,19 @@ export interface BaseFilterResult {
   drawdownPct: number;
 }
 
+/**
+ * Read a GMGN price-style field that may be a scalar (`"0.00041"`) or a nested
+ * object (`{ price: "0.00041" }`). The live `token/info` payload returns `price`
+ * (and sometimes `ath_price`) as the nested form; a plain `toNum` would read that
+ * as undefined and silently zero the price — collapsing market cap to 0.
+ */
+export function infoPrice(field: unknown): number | undefined {
+  if (field !== null && typeof field === 'object') {
+    return toNum((field as { price?: unknown }).price);
+  }
+  return toNum(field);
+}
+
 /** Highest `high` across kline candles (ATH fallback when info.ath_price is missing). */
 export function athFromKline(candles: GmgnKlineCandle[]): number {
   let max = 0;
@@ -90,7 +107,7 @@ export function baseFilter(
     | 'minTokenAgeHours'
     | 'maxTokenAgeDays'
   >,
-  opts: { nowMs?: number; klineAth?: number } = {},
+  opts: { nowMs?: number; klineAth?: number; fallbackMarketCap?: number } = {},
 ): BaseFilterResult {
   const nowMs = opts.nowMs ?? Date.now();
   const reasons: string[] = [];
@@ -100,16 +117,17 @@ export function baseFilter(
     reasons.push(`total_fee ${totalFeeSol} < ${cfg.totalFeeMinSol} SOL`);
   }
 
-  const price = toNum(info.price) ?? 0;
-  // Prefer the explicit market cap; otherwise derive it from price × circulating supply.
+  const price = infoPrice(info.price) ?? 0;
+  // Market cap: explicit info.market_cap → price × circulating supply → rank-row
+  // fallback (e.g. when info omits both). Failing all three it stays 0 and fails.
   const explicitMcap = toNum(info.market_cap);
   const circulating = toNum(info.circulating_supply);
   const marketCap =
-    explicitMcap !== undefined
+    explicitMcap !== undefined && explicitMcap > 0
       ? explicitMcap
-      : circulating !== undefined
+      : circulating !== undefined && price > 0
         ? price * circulating
-        : 0;
+        : (opts.fallbackMarketCap ?? 0);
   if (marketCap < cfg.marketCapMinUsd) {
     reasons.push(`market_cap ${Math.round(marketCap)} < ${cfg.marketCapMinUsd} USD`);
   }
@@ -130,7 +148,7 @@ export function baseFilter(
   }
 
   // Drawdown from ATH: prefer info.ath_price, fall back to the kline-derived high.
-  let athPrice = toNum(info.ath_price) ?? 0;
+  let athPrice = infoPrice(info.ath_price) ?? 0;
   if (!(athPrice > 0) && opts.klineAth !== undefined) athPrice = opts.klineAth;
   let drawdownPct = 0;
   if (athPrice > 0 && price >= 0) {
@@ -298,12 +316,144 @@ export function extractSmartMoney(
   return { smHolding, kolHolding, smExited, kolExited, smUnrealizedPositive, topSmBuyVolume };
 }
 
+/**
+ * Bucket base-filter reasons by their leading keyword and count each, e.g.
+ * `market_cap×8, drawdown×3, total_fee×1`. Keeps the log line short regardless
+ * of how many tokens dropped for the same reason.
+ */
+export function summarizeReasons(reasons: string[]): string {
+  const counts = new Map<string, number>();
+  for (const r of reasons) {
+    const key = r.split(/\s+/, 1)[0] ?? r;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `${k}×${n}`)
+    .join(', ');
+}
+
 function stripUndefined<T extends object>(obj: T): Partial<T> {
   const out: Partial<T> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (v !== undefined) (out as Record<string, unknown>)[k] = v;
   }
   return out;
+}
+
+// --- rich view mapping -----------------------------------------------------
+
+/** Title-case a launchpad tag for display (e.g. "pump" → "Pump"). */
+function prettyPlatform(p: string | undefined): string | undefined {
+  if (!p) return undefined;
+  return p.charAt(0).toUpperCase() + p.slice(1);
+}
+
+function socialsFromInfo(info: GmgnTokenInfo | null): RichTokenView['socials'] {
+  const lnk = info?.link;
+  if (!lnk) return undefined;
+  const twitter = lnk.twitter_username
+    ? `https://x.com/${lnk.twitter_username.replace(/^@/, '')}`
+    : undefined;
+  const out = { website: lnk.website, twitter, telegram: lnk.telegram };
+  return out.website || out.twitter || out.telegram ? out : undefined;
+}
+
+/** Volume (USD) summed across candles. */
+function sumVolume(candles: GmgnKlineCandle[]): number {
+  let s = 0;
+  for (const c of candles) s += toNum(c.volume) ?? 0;
+  return s;
+}
+
+/** Percent change across a candle window (first open → last close). */
+function changePct(candles: GmgnKlineCandle[]): number | undefined {
+  if (candles.length === 0) return undefined;
+  const firstOpen = toNum(candles[0]!.open);
+  const lastClose = toNum(candles[candles.length - 1]!.close);
+  if (firstOpen === undefined || lastClose === undefined || !(firstOpen > 0)) return undefined;
+  return ((lastClose - firstOpen) / firstOpen) * 100;
+}
+
+export interface GmgnDisplayInputs {
+  info: GmgnTokenInfo | null;
+  security?: GmgnTokenSecurity | null;
+  holders?: GmgnWalletEntry[];
+  traders?: GmgnWalletEntry[];
+  recentKline?: GmgnKlineCandle[];
+  /** Total volume from the rank row (token/info has no volume of its own). */
+  rankVolume?: number;
+  /** Pre-computed base values so we don't recompute what the scanner already has. */
+  base?: {
+    price?: number;
+    marketCap?: number;
+    ageHours?: number;
+    athPrice?: number;
+    drawdownPct?: number;
+  };
+}
+
+/**
+ * Map raw GMGN payloads into the display fields of a {@link RichTokenView}. Used by
+ * the scanner (which then adds verdict/warnings) and by the /watch enricher (display
+ * only). Every field is best-effort — missing data is simply omitted.
+ */
+export function buildGmgnDisplay(inp: GmgnDisplayInputs): Partial<RichTokenView> {
+  const { info } = inp;
+  const price = inp.base?.price ?? infoPrice(info?.price);
+  const supply = toNum(info?.circulating_supply) ?? toNum(info?.total_supply);
+  const fdvUsd =
+    inp.base?.marketCap ??
+    toNum(info?.market_cap) ??
+    (price !== undefined && supply !== undefined ? price * supply : undefined);
+  const athPrice = inp.base?.athPrice ?? infoPrice(info?.ath_price);
+  const fdvAthUsd =
+    athPrice !== undefined && supply !== undefined ? athPrice * supply : undefined;
+
+  const recent = inp.recentKline ?? [];
+  const top10Rate =
+    toNum(info?.stat?.top_10_holder_rate) ?? toNum(inp.security?.top_10_holder_rate);
+  // bundler_trader_amount_rate is a 0–1 fraction (same scale screenSecurity compares).
+  const bundlerRate = toNum(inp.security?.bundler_trader_amount_rate);
+
+  const topHolders = (inp.holders ?? [])
+    .filter((h) => h.address && typeof h.amount_percentage === 'number')
+    .slice(0, 5)
+    .map((h) => ({ address: h.address!, pct: (h.amount_percentage as number) * 100 }));
+
+  const sm =
+    inp.holders || inp.traders
+      ? extractSmartMoney(inp.holders ?? [], inp.traders ?? [])
+      : undefined;
+
+  return {
+    symbol: info?.symbol,
+    name: info?.name,
+    platform: prettyPlatform(info?.launchpad_platform),
+    priceUsd: price,
+    fdvUsd,
+    fdvAthUsd,
+    ageHours: inp.base?.ageHours,
+    liquidityUsd: toNum(info?.liquidity),
+    volumeUsd: inp.rankVolume,
+    vol1hUsd: recent.length > 0 ? sumVolume(recent) : undefined,
+    change1hPct: changePct(recent),
+    athUsd: athPrice,
+    drawdownPct: inp.base?.drawdownPct,
+    holderCount: toNum(info?.holder_count),
+    topHolders: topHolders.length > 0 ? topHolders : undefined,
+    top10Pct: top10Rate !== undefined ? top10Rate * 100 : undefined,
+    bundledPct: bundlerRate !== undefined ? bundlerRate * 100 : undefined,
+    smartMoney: sm
+      ? {
+          smHolding: sm.smHolding,
+          kolHolding: sm.kolHolding,
+          smExited: sm.smExited,
+          smUnrealizedPositive: sm.smUnrealizedPositive,
+        }
+      : undefined,
+    socials: socialsFromInfo(info),
+  };
 }
 
 // --- volume authenticity ---------------------------------------------------
@@ -386,12 +536,24 @@ export function analyzeVolume(
 /** Delivers a batch of messages; returns true if at least one subscriber got them. */
 export type GmgnNotifier = (messages: string[]) => Promise<boolean>;
 
+/** Per-cycle counts, surfaced for manual-trigger replies and logging. */
+export interface CycleSummary {
+  trending: number;
+  quickPass: number;
+  basePass: number;
+  deliverable: number;
+  fresh: number;
+  delivered: boolean;
+}
+
 export interface ScannerDeps {
   client: GmgnClient;
   store: GmgnScreenedStore;
   notify: GmgnNotifier;
   /** Optional watch store for GMGN_AUTO_WATCH. */
   watchStore?: AlertStore;
+  /** Optional Meteora DLMM linker; adds pool links to deliverable alerts. */
+  meteora?: MeteoraLinker;
   now?: () => number;
 }
 
@@ -427,6 +589,10 @@ export class GmgnScanner {
   private stopped = false;
   /** The in-flight cycle promise, so shutdown can await it instead of racing it. */
   private currentCycle: Promise<ScreenedCandidate[] | null> | null = null;
+  /** Base-filter drop reasons for the current cycle (reset each scan, for debug logging). */
+  private baseDropReasons: string[] = [];
+  /** Counts from the most recent completed cycle (for the manual /scan reply). */
+  private lastSummary: CycleSummary | null = null;
   private readonly now: () => number;
 
   constructor(
@@ -492,8 +658,19 @@ export class GmgnScanner {
     }
   }
 
+  /**
+   * Run one cycle on demand (e.g. a manual `/scan` command) and return its summary.
+   * Reuses {@link runCycle}'s overlap guard: returns null if a cycle is already
+   * running or the scanner is stopped, rather than launching a concurrent scan.
+   */
+  async scanNow(): Promise<CycleSummary | null> {
+    const result = await this.runCycle();
+    return result === null ? null : this.lastSummary;
+  }
+
   /** One full scan cycle. Returns every base-passing candidate (PASS/WARN/FAIL). */
   async scanOnce(): Promise<ScreenedCandidate[]> {
+    this.baseDropReasons = [];
     const rank = await this.deps.client.getRank({
       chain: CHAIN,
       interval: '5m',
@@ -517,9 +694,10 @@ export class GmgnScanner {
 
     // Don't deliver if shutdown began while we were screening — Telegram may be
     // stopping. The fresh candidates stay un-recorded and re-alert on next startup.
+    let delivered = false;
     if (fresh.length > 0 && !this.stopped) {
-      const messages = formatCandidates(fresh);
-      let delivered = false;
+      await this.attachMeteoraLinks(fresh);
+      const messages = formatRichMessages(fresh.map((c) => c.view));
       try {
         delivered = await this.deps.notify(messages);
       } catch (err) {
@@ -550,7 +728,42 @@ export class GmgnScanner {
       `[gmgn] cycle: ${rank.length} trending → ${candidates.length} quick-pass → ` +
         `${passed.length} base-pass → ${deliverable.length} deliverable → ${fresh.length} new`,
     );
+    // When nothing clears the base filter, surface the top reasons so a misparse
+    // (e.g. price→0→mcap 0) or simply "no token matched" is visible in the logs.
+    if (passed.length === 0 && this.baseDropReasons.length > 0) {
+      console.log(`[gmgn] base-filter drops: ${summarizeReasons(this.baseDropReasons)}`);
+    }
+    this.lastSummary = {
+      trending: rank.length,
+      quickPass: candidates.length,
+      basePass: passed.length,
+      deliverable: deliverable.length,
+      fresh: fresh.length,
+      delivered,
+    };
     return passed;
+  }
+
+  /**
+   * Best-effort: attach Meteora DLMM pool links to each candidate's view before
+   * delivery. Done only for the (few) candidates actually being alerted, and any
+   * per-token failure is logged and skipped rather than aborting the alert.
+   */
+  private async attachMeteoraLinks(candidates: ScreenedCandidate[]): Promise<void> {
+    const linker = this.deps.meteora;
+    if (!linker) return;
+    await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          c.view.meteoraPools = await linker(c.mint);
+        } catch (err) {
+          console.error(
+            `[gmgn] meteora links ${c.mint} failed:`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }),
+    );
   }
 
   /**
@@ -569,12 +782,19 @@ export class GmgnScanner {
       // FULL-lifetime kline (hourly candles since launch) — not the recent window,
       // whose high is not an all-time high. baseFilter fails closed if this yields 0.
       let klineAth: number | undefined;
-      if (!(toNum(info.ath_price)! > 0)) {
+      if (!((infoPrice(info.ath_price) ?? 0) > 0)) {
         const athCandles = await this.fetchAthKline(mint, info, nowMs);
         klineAth = athFromKline(athCandles);
       }
-      const base = baseFilter(info, this.cfg, { nowMs, klineAth });
-      if (!base.pass) return null;
+      const base = baseFilter(info, this.cfg, {
+        nowMs,
+        klineAth,
+        fallbackMarketCap: toNum(item.market_cap),
+      });
+      if (!base.pass) {
+        for (const r of base.reasons) this.baseDropReasons.push(r);
+        return null;
+      }
 
       // Screening workflow (security → holders/traders → volume authenticity).
       const security = await this.deps.client.getTokenSecurity(CHAIN, mint);
@@ -602,6 +822,33 @@ export class GmgnScanner {
       const verdict: ScreeningVerdict =
         sec.hardFails.length > 0 ? 'FAIL' : warnings.length > 0 ? 'WARN' : 'PASS';
 
+      const display = buildGmgnDisplay({
+        info,
+        security,
+        holders,
+        traders,
+        recentKline,
+        rankVolume: toNum(item.volume),
+        base: {
+          price: base.price,
+          marketCap: base.marketCap,
+          ageHours: base.ageHours,
+          athPrice: base.athPrice,
+          drawdownPct: base.drawdownPct,
+        },
+      });
+      const view: RichTokenView = {
+        ...display,
+        kind: 'gmgn',
+        mint,
+        symbol: info.symbol ?? item.symbol,
+        name: info.name ?? item.name,
+        chain: 'Solana',
+        verdict,
+        warnings,
+        hardFails: sec.hardFails,
+      };
+
       return {
         mint,
         symbol: info.symbol ?? item.symbol,
@@ -621,6 +868,7 @@ export class GmgnScanner {
           jupiter: `https://jup.ag/tokens/${mint}`,
           birdeye: `https://birdeye.so/token/${mint}?chain=solana`,
         },
+        view,
       };
     } catch (err) {
       console.error(`[gmgn] screening ${mint} failed:`, err instanceof Error ? err.message : err);

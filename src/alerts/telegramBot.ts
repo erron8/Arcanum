@@ -9,7 +9,18 @@ import type { AlertStore } from './store';
 import type { AthMonitor, AlertSink } from './athMonitor';
 import type { AppConfig } from './config';
 import { isChatAuthorized } from './auth';
-import { escMarkdownV2 as esc, fmtPrice, fmtPct, formatAlertMessages } from './format';
+import { escMarkdownV2 as esc, fmtPrice, fmtPct } from './format';
+import { formatRichMessages } from './richFormat';
+import type { RichTokenView } from './richFormat';
+import type { CycleSummary } from '../gmgn/scanner';
+import type { GmgnEnricher } from '../gmgn/enrich';
+import type { MeteoraLinker, MeteoraPoolLink } from '../meteora/client';
+
+/** Wrapped-SOL mint, used by /testalert as a known token with live pools. */
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+/** Runs one GMGN scan cycle on demand; null means a cycle was already running. */
+export type GmgnScanTrigger = () => Promise<CycleSummary | null>;
 
 /** base58, 32–44 chars (Solana mint). */
 const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -40,6 +51,12 @@ export class TelegramTransport {
   private readonly subscribers = new Set<number>();
   private readonly fetchSymbol: SymbolFetcher;
   private webhookServer: ReturnType<typeof createServer> | null = null;
+  /** Optional manual GMGN scan trigger; set only when the scanner is enabled. */
+  private gmgnScan: GmgnScanTrigger | null = null;
+  /** Optional GMGN enricher used to fill the rich layout for /watch alerts. */
+  private gmgnEnrich: GmgnEnricher | null = null;
+  /** Optional Meteora DLMM linker; adds pool links to /watch alerts. */
+  private meteoraLink: MeteoraLinker | null = null;
 
   constructor(
     token: string,
@@ -95,6 +112,29 @@ export class TelegramTransport {
   /** Read-only snapshot of current subscriber chat IDs (for testing/inspection). */
   subscriberIds(): number[] {
     return [...this.subscribers];
+  }
+
+  /**
+   * Enable the `/scan` command by wiring a manual GMGN scan trigger. Set by the
+   * composition root only when the scanner is enabled; otherwise `/scan` replies
+   * that the scanner is off.
+   */
+  setGmgnScan(trigger: GmgnScanTrigger): void {
+    this.gmgnScan = trigger;
+  }
+
+  /**
+   * Wire a GMGN enricher so /watch drawdown alerts are rendered with the full rich
+   * layout (market cap, liquidity, holders, etc.). Best-effort: if it's unset or
+   * fails, watch alerts fall back to the basic price/ATH/drawdown view.
+   */
+  setGmgnEnricher(enrich: GmgnEnricher): void {
+    this.gmgnEnrich = enrich;
+  }
+
+  /** Wire a Meteora linker so /watch alerts include DLMM pool links (best-effort). */
+  setMeteoraLinker(linker: MeteoraLinker): void {
+    this.meteoraLink = linker;
   }
 
   /**
@@ -241,11 +281,116 @@ export class TelegramTransport {
   buildSink(): AlertSink {
     return async (alerts: AlertPayload[]): Promise<string[]> => {
       if (alerts.length === 0) return [];
-      const messages = formatAlertMessages(alerts, this.cfg.quote);
+      const views = await Promise.all(alerts.map((a) => this.buildWatchView(a)));
+      const messages = formatRichMessages(views);
       const anyDelivered = await this.broadcast(messages);
       // Consumed only if at least one subscriber actually received the batch.
       return anyDelivered ? alerts.map((a) => a.mint) : [];
     };
+  }
+
+  /**
+   * Build the rich view for a /watch alert. The watch framing (trigger drawdown,
+   * threshold, price/ATH in the configured quote) always comes from the alert payload;
+   * GMGN enrichment only fills the extra display fields and the symbol/name fallback.
+   */
+  private async buildWatchView(a: AlertPayload): Promise<RichTokenView> {
+    const { extra, pools } = await this.fetchEnrichment(a.mint);
+    return {
+      ...extra,
+      kind: 'watch',
+      mint: a.mint,
+      symbol: a.symbol ?? extra.symbol,
+      chain: 'Solana',
+      priceUsd: a.price,
+      athUsd: a.ath,
+      drawdownPct: a.drawdownPct,
+      threshold: a.threshold,
+      meteoraPools: pools.length > 0 ? pools : undefined,
+      quote: this.cfg.quote,
+    };
+  }
+
+  /**
+   * Fetch the optional GMGN display fields + Meteora pool links for a mint. Both are
+   * independent and best-effort, run in parallel; failures resolve to empty so an
+   * alert always renders.
+   */
+  private async fetchEnrichment(
+    mint: string,
+  ): Promise<{ extra: Partial<RichTokenView>; pools: MeteoraPoolLink[] }> {
+    const [extra, pools] = await Promise.all([
+      this.gmgnEnrich
+        ? this.gmgnEnrich(mint).catch((err) => {
+            console.error(`[telegram] GMGN enrich ${mint} failed:`, err);
+            return null;
+          })
+        : Promise.resolve(null),
+      this.meteoraLink
+        ? this.meteoraLink(mint).catch((err) => {
+            console.error(`[telegram] Meteora links ${mint} failed:`, err);
+            return [];
+          })
+        : Promise.resolve([]),
+    ]);
+    return { extra: extra ?? {}, pools };
+  }
+
+  /**
+   * Render example alerts (watch + GMGN style) so a user can preview the alert layout
+   * on demand via /testalert. Uses curated, internally-consistent sample stats (the
+   * live GMGN record for the SOL mint is not representative of a memecoin alert), but
+   * keeps the **live Meteora DLMM pool links** for the SOL mint (SOL/USDC etc.).
+   */
+  async processExample(chatId: number): Promise<void> {
+    let pools: MeteoraPoolLink[] = [];
+    if (this.meteoraLink) {
+      try {
+        pools = await this.meteoraLink(SOL_MINT);
+      } catch (err) {
+        console.error('[telegram] Meteora links (example) failed:', err);
+      }
+    }
+
+    // Curated sample so the preview is always clean and complete.
+    const sample: Partial<RichTokenView> = {
+      mint: SOL_MINT,
+      symbol: 'SOL',
+      name: 'Wrapped SOL',
+      chain: 'Solana',
+      platform: 'Raydium',
+      priceUsd: 152.34,
+      fdvUsd: 72_000_000_000,
+      fdvAthUsd: 122_900_000_000,
+      liquidityUsd: 8_500_000,
+      volumeUsd: 1_900_000_000,
+      vol1hUsd: 95_000_000,
+      change1hPct: -1.2,
+      athUsd: 259.96,
+      drawdownPct: 41.4,
+      holderCount: 1_200_000,
+      top10Pct: 18,
+      smartMoney: { smHolding: 6, kolHolding: 3, smExited: 2, smUnrealizedPositive: 4 },
+      socials: { website: 'https://solana.com', twitter: 'https://x.com/solana' },
+      meteoraPools: pools.length > 0 ? pools : undefined,
+    };
+    const watchView: RichTokenView = { ...sample, mint: SOL_MINT, kind: 'watch', threshold: 40, quote: 'usd' };
+    const gmgnView: RichTokenView = {
+      ...sample,
+      mint: SOL_MINT,
+      kind: 'gmgn',
+      verdict: 'PASS',
+      warnings: [],
+      hardFails: [],
+      quote: 'usd',
+    };
+
+    await this.sendDirect(
+      chatId,
+      '🧪 *Example alerts* — sample render \\(SOL\\)\\. Preview only, not a real trigger\\.',
+    );
+    const messages = [...formatRichMessages([watchView]), ...formatRichMessages([gmgnView])];
+    for (const m of messages) await this.sendDirect(chatId, m);
   }
 
   /**
@@ -526,6 +671,60 @@ export class TelegramTransport {
         { parse_mode: 'MarkdownV2' },
       );
     });
+
+    bot.command('scan', async (ctx) => {
+      this.remember(ctx.chat?.id);
+      if (!this.gmgnScan) {
+        await ctx.reply(
+          'GMGN scanner is not enabled\\. Set `GMGN_SCAN_ENABLED=true` \\(and `GMGN_API_KEY`\\) to use this\\.',
+          { parse_mode: 'MarkdownV2' },
+        );
+        return;
+      }
+      // Ack immediately; the cycle can take several seconds (rank + per-token detail).
+      await ctx.reply('⏳ Running a GMGN scan cycle…', { parse_mode: 'MarkdownV2' });
+      const chatId = ctx.chat?.id;
+      if (chatId !== undefined) void this.processScan(chatId);
+    });
+
+    bot.command('testalert', async (ctx) => {
+      this.remember(ctx.chat?.id);
+      // Ack immediately; enrichment (GMGN + Meteora) can take a moment.
+      await ctx.reply('🧪 Building an example alert…', { parse_mode: 'MarkdownV2' });
+      const chatId = ctx.chat?.id;
+      if (chatId !== undefined) void this.processExample(chatId);
+    });
+  }
+
+  /** Async body of /scan: run one GMGN cycle, then follow up with the counts. */
+  async processScan(chatId: number): Promise<void> {
+    if (!this.gmgnScan) return;
+    let summary: CycleSummary | null;
+    try {
+      summary = await this.gmgnScan();
+    } catch (err) {
+      console.error('[telegram] /scan failed:', err);
+      await this.sendDirect(chatId, 'GMGN scan failed; check the logs and try again later\\.');
+      return;
+    }
+    if (summary === null) {
+      await this.sendDirect(
+        chatId,
+        '⏳ A scan is already running — its results will arrive shortly\\.',
+      );
+      return;
+    }
+    const lines = [
+      '🔎 *GMGN scan complete*',
+      `Trending: ${summary.trending}  ·  Quick\\-pass: ${summary.quickPass}`,
+      `Base\\-pass: ${summary.basePass}  ·  Deliverable: ${summary.deliverable}`,
+      summary.fresh === 0
+        ? 'No new candidates \\(already alerted or none matched\\)\\.'
+        : summary.delivered
+          ? `✅ Sent *${summary.fresh}* new alert\\(s\\)\\.`
+          : `⚠️ *${summary.fresh}* new candidate\\(s\\) found but delivery failed — will retry next cycle\\.`,
+    ];
+    await this.sendDirect(chatId, lines.join('\n'));
   }
 
   /** Send a one-off MarkdownV2 message directly (command replies; not the alert queue). */
@@ -631,5 +830,7 @@ const HELP_TEXT = [
   '/threshold `<mint|all>` `<pct>` — set drawdown threshold',
   '/status `<mint>` — current price, rolling ATH and drawdown',
   '/resetath `<mint>` — reset the stored ATH and re\\-arm',
+  '/scan — run a GMGN drawdown scan cycle now \\(if the scanner is enabled\\)',
+  '/testalert — preview an example alert \\(rendered for SOL\\)',
   '/help — this message',
 ].join('\n');

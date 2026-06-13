@@ -5,6 +5,9 @@ import { TelegramTransport } from './telegramBot';
 import { GmgnClient } from '../gmgn/client';
 import { GmgnScreenedStore } from '../gmgn/store';
 import { GmgnScanner } from '../gmgn/scanner';
+import { makeGmgnEnricher } from '../gmgn/enrich';
+import { MeteoraClient } from '../meteora/client';
+import type { MeteoraLinker } from '../meteora/client';
 
 /** Best-effort .env loading: use dotenv if installed, otherwise rely on process.env. */
 async function loadEnv(): Promise<void> {
@@ -49,24 +52,50 @@ async function main(): Promise<void> {
   // Wire monitor → telegram (settable sink resolves the circular dependency).
   monitor.setSink(bot.buildSink());
 
+  // A GMGN client is built whenever an API key is configured. It powers two
+  // independent features: the optional scanner, and rich-layout enrichment for
+  // /watch alerts. Either can be active without the other.
+  const gmgnClient = config.gmgn.apiKey
+    ? new GmgnClient({
+        baseUrl: config.gmgn.baseUrl,
+        apiKey: config.gmgn.apiKey,
+        attempts: config.gmgn.attempts,
+        backoffMs: config.gmgn.backoffMs,
+        timeoutMs: config.gmgn.timeoutMs,
+      })
+    : null;
+
+  // Enrich /watch alerts with the rich GMGN layout when a client is available.
+  if (gmgnClient) bot.setGmgnEnricher(makeGmgnEnricher(gmgnClient));
+
+  // Meteora DLMM pool links (public API, no key) — added to both alert types.
+  let meteoraLinker: MeteoraLinker | undefined;
+  if (config.meteora.enabled) {
+    const meteora = new MeteoraClient({
+      baseUrl: config.meteora.baseUrl,
+      maxPools: config.meteora.maxPools,
+      attempts: config.meteora.attempts,
+      backoffMs: config.meteora.backoffMs,
+      timeoutMs: config.meteora.timeoutMs,
+    });
+    meteoraLinker = (mint) => meteora.getPoolsByMint(mint);
+    bot.setMeteoraLinker(meteoraLinker);
+  }
+
   // Optional GMGN drawdown scanner — disabled by default; never affects /watch.
   let gmgnScanner: GmgnScanner | null = null;
-  if (config.gmgn.enabled) {
-    const client = new GmgnClient({
-      baseUrl: config.gmgn.baseUrl,
-      apiKey: config.gmgn.apiKey,
-      attempts: config.gmgn.attempts,
-      backoffMs: config.gmgn.backoffMs,
-      timeoutMs: config.gmgn.timeoutMs,
-    });
+  if (config.gmgn.enabled && gmgnClient) {
     const screenedStore = new GmgnScreenedStore(config.gmgn.screenedPath);
     await screenedStore.init();
     gmgnScanner = new GmgnScanner(config.gmgn, {
-      client,
+      client: gmgnClient,
       store: screenedStore,
       notify: (messages) => bot.notify(messages),
       watchStore: config.gmgn.autoWatch ? store : undefined,
+      meteora: meteoraLinker,
     });
+    // Enable the manual /scan command (runs one cycle on demand).
+    bot.setGmgnScan(() => gmgnScanner!.scanNow());
   }
 
   let shuttingDown = false;

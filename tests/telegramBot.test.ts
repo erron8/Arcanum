@@ -125,6 +125,8 @@ async function waitUntil(pred: () => boolean, timeoutMs = 2000): Promise<void> {
 }
 
 const MINT = 'So11111111111111111111111111111111111111112';
+/** /testalert renders for wrapped SOL. */
+const SOL_MINT_FOR_TEST = 'So11111111111111111111111111111111111111112';
 
 describe('TelegramTransport subscriber authorization', () => {
   test('prunes unauthorized subscribers on init when allowlist is set', async () => {
@@ -206,6 +208,36 @@ describe('TelegramTransport delivery (confirmed)', () => {
     await bot.init();
     const accepted = await bot.buildSink()([payload('m1')]);
     expect(accepted).toEqual([]);
+  });
+
+  test('watch alert renders the rich layout, enriched by GMGN when wired', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [1] }, [1]);
+    await bot.init();
+    const sent = recorder(bot);
+    bot.setGmgnEnricher(async () => ({
+      symbol: 'WIF',
+      platform: 'Pump',
+      fdvUsd: 980_000,
+      liquidityUsd: 120_000,
+      holderCount: 4321,
+    }));
+    await bot.buildSink()([payload('m1')]);
+    const msg = sent.map((s) => s.text).join('\n');
+    expect(msg).toContain('ATH Drawdown Alert'); // watch framing preserved
+    expect(msg).toContain('FDV'); // enriched field present
+    expect(msg).toContain('Holders: 4321');
+  });
+
+  test('watch alert still sends (basic view) when enrichment throws', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [1] }, [1]);
+    await bot.init();
+    const sent = recorder(bot);
+    bot.setGmgnEnricher(async () => {
+      throw new Error('gmgn down');
+    });
+    const accepted = await bot.buildSink()([payload('m1')]);
+    expect(accepted).toEqual(['m1']); // delivered despite enrichment failure
+    expect(sent.map((s) => s.text).join('\n')).toContain('ATH Drawdown Alert');
   });
 
   test('a 5xx/network failure is NOT accepted (alert will retry)', async () => {
@@ -348,5 +380,59 @@ describe('TelegramTransport commands (real handler path)', () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(store.has(MINT)).toBe(false);
     expect(sent.some((m) => m.text.includes('not authorized'))).toBe(true);
+  });
+
+  test('/scan replies that the scanner is off when no trigger is wired', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/scan'));
+    expect(sent.some((m) => m.text.includes('not enabled'))).toBe(true);
+  });
+
+  test('/scan runs a cycle and reports the summary', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    bot.setGmgnScan(async () => ({
+      trending: 25,
+      quickPass: 8,
+      basePass: 2,
+      deliverable: 2,
+      fresh: 1,
+      delivered: true,
+    }));
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/scan'));
+    await waitUntil(() => sent.some((m) => m.text.includes('scan complete')));
+    expect(sent.some((m) => m.text.includes('Sent *1* new alert'))).toBe(true);
+  });
+
+  test('/scan reports an in-progress cycle when the trigger returns null', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    bot.setGmgnScan(async () => null);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/scan'));
+    await waitUntil(() => sent.some((m) => m.text.includes('already running')));
+  });
+
+  test('/testalert previews both alert styles with live Meteora links', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    bot.setMeteoraLinker(async () => [
+      { poolAddress: 'P1', pair: 'SOL/USDC', url: 'https://app.meteora.ag/dlmm/P1' },
+    ]);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/testalert'));
+    await waitUntil(() => sent.some((m) => m.text.includes('Example alerts')));
+    const all = sent.map((m) => m.text).join('\n');
+    expect(all).toContain('ATH Drawdown Alert'); // watch-style example
+    expect(all).toContain('GMGN Screening Alert'); // gmgn-style example
+    expect(all).toContain('SOL/USDC'); // live Meteora pool link
+    expect(all).toContain('Wrapped SOL'); // curated sample
+  });
+
+  test('/testalert still renders when no Meteora linker is wired', async () => {
+    const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, '/testalert'));
+    await waitUntil(() => sent.some((m) => m.text.includes('Example alerts')));
+    expect(sent.map((m) => m.text).join('\n')).toContain(SOL_MINT_FOR_TEST);
   });
 });

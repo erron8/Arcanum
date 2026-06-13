@@ -40,6 +40,23 @@ export const GMGN_DEFAULT_BASE_URL = 'https://openapi.gmgn.ai';
 /** Hard cap on scan concurrency so a misconfigured value can't hammer the API. */
 export const GMGN_MAX_CONCURRENCY = 32;
 
+/** Default Meteora DLMM Data API base URL; overridable via METEORA_BASE_URL. */
+export const METEORA_DEFAULT_BASE_URL = 'https://dlmm.datapi.meteora.ag';
+
+/**
+ * Configuration for the optional Meteora DLMM pool links added to alert messages.
+ * Enabled by default (public API, no key); best-effort — failures never block alerts.
+ */
+export interface MeteoraConfig {
+  enabled: boolean;
+  baseUrl: string;
+  /** Max pool links shown per alert (top pools by 24h volume). */
+  maxPools: number;
+  attempts: number;
+  backoffMs: number;
+  timeoutMs: number;
+}
+
 /**
  * Configuration for the optional GMGN drawdown scanner. The scanner is disabled
  * by default and never affects the existing /watch flow.
@@ -89,6 +106,19 @@ export interface AppConfig {
   webhookPort: number;
   webhookSecret: string | undefined;
   gmgn: GmgnConfig;
+  meteora: MeteoraConfig;
+}
+
+/** Build the Meteora sub-config from the environment (pure; defaults for blanks). */
+function buildMeteoraConfig(env: Env): MeteoraConfig {
+  return {
+    enabled: rawBool(env, 'METEORA_LINKS_ENABLED', true),
+    baseUrl: rawStr(env, 'METEORA_BASE_URL', METEORA_DEFAULT_BASE_URL).replace(/\/+$/, ''),
+    maxPools: rawNum(env, 'METEORA_MAX_POOLS', 5),
+    attempts: rawNum(env, 'FETCH_ATTEMPTS', 3),
+    backoffMs: rawNum(env, 'FETCH_BACKOFF_MS', 500),
+    timeoutMs: rawNum(env, 'FETCH_TIMEOUT_MS', 8_000),
+  };
 }
 
 /** Build the GMGN sub-config from the environment (pure; defaults for blanks). */
@@ -152,6 +182,7 @@ export function buildConfig(env: Env): AppConfig {
     webhookPort: rawNum(env, 'WEBHOOK_PORT', 8080),
     webhookSecret: env.WEBHOOK_SECRET_TOKEN?.trim() || undefined,
     gmgn: buildGmgnConfig(env),
+    meteora: buildMeteoraConfig(env),
   };
 }
 
@@ -296,6 +327,12 @@ export function validateEnv(env: Env): string[] {
   }
 
   validateGmgnEnv(env, errors, { requirePositive, requireRange, requireInt });
+
+  // Meteora pool links: bound the per-alert link count.
+  const maxPools = requireInt('METEORA_MAX_POOLS', 5, 1);
+  if (Number.isFinite(maxPools) && maxPools > 10) {
+    errors.push(`METEORA_MAX_POOLS must be in [1, 10] (got '${env.METEORA_MAX_POOLS}').`);
+  }
 
   return errors;
 }
