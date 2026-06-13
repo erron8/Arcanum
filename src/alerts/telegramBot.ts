@@ -606,17 +606,18 @@ export class TelegramTransport {
       await this.replyTo(
         ctx,
         [
-          '👋 *ATH Drawdown Bot*',
+          '📜 *Arcanum*',
           '',
-          'I ping you the moment a token you watch drops a set % below its rolling all\\-time high\\.',
+          'I track drawdown from all\\-time highs on Solana memecoins — automatically and on demand\\.',
           '',
-          '🚀 *Get started*',
-          '   📈  /watch `<mint>` — watch a token',
-          '   🔍  /check `<mint>` — full token card',
-          '   📋  /list — your watchlist',
-          '   ❓  /help — see every command',
+          '🔎 *Automatic* — I scan trending memecoins and alert you when one is deep in drawdown but still alive\\. Force a scan with /scan\\.',
           '',
-          '🔔 You are now subscribed to alerts\\.',
+          '🚀 *Manual*',
+          '   🔍  /check `<mint>` — full card for any token, now',
+          '   📈  /watch `<mint>` — track one and alert on drawdown',
+          '   📋  /list — your watchlist · ❓ /help — all commands',
+          '',
+          '🔔 You are now subscribed — scanner alerts will arrive here\\.',
         ].join('\n'),
       );
     });
@@ -786,7 +787,7 @@ export class TelegramTransport {
       if (!this.gmgnScan) {
         await this.replyTo(
           ctx,
-          ['🛑 *GMGN scanner is not enabled*', '', 'Set `GMGN_SCAN_ENABLED=true` and `GMGN_API_KEY` to use this\\.'].join('\n'),
+          ['🛑 *Scanner unavailable*', '', 'The GMGN scanner is not wired up on this instance\\.'].join('\n'),
         );
         return;
       }
@@ -813,7 +814,7 @@ export class TelegramTransport {
   /** Build the MarkdownV2 reply for /gmgnstatus from the scanner status provider. */
   private gmgnStatusText(): string {
     if (!this.gmgnStatus) {
-      return ['🛑 *GMGN scanner is not enabled*', '', 'Set `GMGN_SCAN_ENABLED=true` and `GMGN_API_KEY` to use this\\.'].join('\n');
+      return ['🛑 *Scanner unavailable*', '', 'The GMGN scanner is not wired up on this instance\\.'].join('\n');
     }
     const s = this.gmgnStatus();
     const lines: string[] = ['📊 *GMGN scanner status*', ''];
@@ -1075,26 +1076,26 @@ export class TelegramTransport {
 }
 
 const HELP_TEXT = [
-  '🤖 *ATH Drawdown Bot — Commands*',
+  '📜 *Arcanum*',
   '',
-  '👀 *Watchlist*',
-  '   📈 /watch `<mint>` `[pct]` — watch a token \\(verified on Jupiter first\\)',
-  '   🗑️ /unwatch `<mint>` — stop watching',
-  '   📋 /list — list watched tokens',
-  '   🎯 /threshold `<mint|all>` `<pct>` — set drawdown threshold',
-  '   📊 /status `<mint>` — current price, rolling ATH and drawdown',
-  '   🔍 /check `<mint>` — full token card \\(market cap, holders, pools…\\)',
-  '   ♻️ /resetath `<mint>` — reset the stored ATH and re\\-arm',
+  '📋 *Watchlist*',
+  '/watch `<mint> [pct]` — track a token',
+  '/unwatch `<mint>` — stop tracking',
+  '/list — your watchlist',
+  '/threshold `<mint|all> <pct>` — set alert %',
+  '/status `<mint>` — price · ATH · drawdown',
+  '/check `<mint>` — full token card',
+  '/resetath `<mint>` — reset stored ATH',
   '',
-  '🔎 *GMGN scanner*',
-  '   ⚡ /scan — run a drawdown scan cycle now',
-  '   📡 /gmgnstatus — show the last scan summary',
+  '🔎 *Scanner*',
+  '/scan — scan trending coins now',
+  '/gmgnstatus — last scan summary',
   '',
   '🔔 *Subscription*',
-  '   ✅ /start — subscribe this chat to alerts',
-  '   🔕 /stop — unsubscribe this chat',
+  '/start — subscribe to alerts',
+  '/stop — unsubscribe',
   '',
-  '🧪 *Misc*',
-  '   🖼️ /testalert — preview an example alert \\(rendered for SOL\\)',
-  '   ❓ /help — this message',
+  '🧪 *Other*',
+  '/testalert — preview an example alert',
+  '/help — this message',
 ].join('\n');

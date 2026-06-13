@@ -1,25 +1,29 @@
-# ATH Drawdown Bot
+# 📜 Arcanum
 
-A Telegram bot for Solana tokens that alerts you when a coin drops a set percentage
-below its all‑time high (ATH) — and renders a rich, at‑a‑glance card for any token on
-demand.
+**📜 Arcanum** is a Telegram bot that **automatically and manually tracks drawdown from
+trending Solana memecoins** — coins that have fallen far below their all‑time high (ATH)
+but are still alive.
 
-Built with **Bun** + **TypeScript** + **grammY**, using the **Jupiter**, **GMGN**, and
-**Meteora** APIs.
+Built with **Bun** + **TypeScript** + **grammY**, powered by the **GMGN**, **Jupiter**,
+and **Meteora** APIs.
 
 ---
 
 ## What it does
 
-- 🔻 **Drawdown alerts** — `/watch` a token and get pinged the moment it falls a
-  configurable % below its rolling ATH.
-- 🔍 **On‑demand cards** — `/check <mint>` shows a full token card (price, market cap,
-  liquidity, holders, smart‑money, DLMM pools…) for any token, instantly.
-- 🔎 **Drawdown scanner** *(optional)* — a background cron that hunts for coins deep in
-  drawdown but still alive, screens them for safety, and alerts on the survivors.
+- 🔎 **Automatic scanning** — a built‑in scanner continuously sweeps **trending Solana
+  memecoins**, keeps the ones that are deep in drawdown but still active, screens them
+  for safety (renounce status, holder concentration, snipers, bundlers, wash‑trading,
+  smart‑money), and alerts you on the survivors. Runs on a timer and on demand via
+  `/scan`.
+- 🔍 **Manual tracking** — `/check <mint>` renders a full token card for **any** coin
+  instantly; `/watch <mint>` follows a token and pings you the moment it crosses your
+  drawdown threshold.
+- 📊 **Rich cards** — every alert and card shows market cap (now ⇨ ATH), drawdown,
+  liquidity, 24h volume, top holders, smart‑money/KOL activity, socials, and the token's
+  **Meteora DLMM pools** — with the name linked to **GMGN**.
 
-Every alert and card links the token name to **GMGN**, lists its top **Meteora DLMM
-pools**, and works in both DMs and **group chats** (replies tag whoever ran the command).
+Works in DMs and **group chats** (replies tag whoever ran the command).
 
 ---
 
@@ -57,8 +61,14 @@ cashtag — tap it to search the chat for that token.
 
 ## Quick start
 
-**Requirements:** [Bun](https://bun.sh) and a Telegram bot token from
-[@BotFather](https://t.me/BotFather).
+**Requirements:**
+
+- [Bun](https://bun.sh)
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- A **GMGN OpenAPI key** — required; it powers the trending‑memecoin scanning and the
+  rich token data on every card. Get one at
+  [gmgn.ai → API Management](https://gmgn.ai/ai?chain=sol&tab=api_management) → **Create
+  API Key**.
 
 ```bash
 git clone https://github.com/erron8/Arcanum.git
@@ -72,6 +82,7 @@ Edit `.env` and set at least:
 ```env
 TELEGRAM_BOT_TOKEN=your-botfather-token
 TELEGRAM_ALLOWED_CHAT_IDS=123456789      # your Telegram chat/user id(s), comma-separated
+GMGN_API_KEY=your-gmgn-openapi-key
 ```
 
 > Don't know your chat id? Message [@userinfobot](https://t.me/userinfobot). The
@@ -83,11 +94,17 @@ Run it:
 bun run start
 ```
 
-Then in Telegram: send **`/start`**, then **`/watch <token_mint>`**. That's it — you'll
-get an alert when the token is 50% below its ATH (change the threshold per token, e.g.
-`/watch <mint> 40`).
+The scanner starts sweeping trending memecoins immediately and then on a timer.
 
-To add the bot to a **group**, just invite it and have members run commands there.
+> ⚠️ **Send `/start` to the bot first** (or set `TELEGRAM_CHAT_ID` in `.env`). Automatic
+> scanner alerts are only delivered to chats that have subscribed — with no subscribers,
+> the scanner finds candidates but has nowhere to send them.
+
+To track a specific coin yourself, send **`/watch <token_mint>`** (alerts at 50% below
+ATH by default; set your own with `/watch <mint> 40`), or get a one‑off card with
+**`/check <token_mint>`**.
+
+To use the bot in a **group**, just invite it and have members run commands there.
 
 ---
 
@@ -104,8 +121,8 @@ To add the bot to a **group**, just invite it and have members run commands ther
 | `/status <mint>` | Quick price / ATH / drawdown for a watched token |
 | `/check <mint>` | Full token card for **any** mint (no need to watch it) |
 | `/resetath <mint>` | Reset a token's stored ATH and re‑arm its alert |
-| `/scan` | Run the drawdown scanner now *(if enabled)* |
-| `/gmgnstatus` | Last scanner run summary *(if enabled)* |
+| `/scan` | Run the trending‑memecoin drawdown scan right now |
+| `/gmgnstatus` | Summary of the last scan (counts, drop reasons, last alert, errors) |
 | `/testalert` | Preview what an alert looks like |
 | `/help` | List all commands |
 
@@ -113,24 +130,28 @@ All commands also appear in Telegram's **Menu** button and `/` autocomplete.
 
 ---
 
-## Optional: GMGN data & scanner
+## How scanning works
 
-The bot works out of the box with Jupiter price data. Adding a **GMGN OpenAPI key**
-unlocks the rich card data (market cap, liquidity, holders, smart‑money) for `/watch`
-and `/check`, and lets you enable the background scanner:
+The scanner runs **automatically on a timer** (every 5 minutes by default) and **on
+demand** with `/scan`. Each pass:
 
-```env
-GMGN_API_KEY=your-gmgn-key       # enriches /watch and /check cards
-GMGN_SCAN_ENABLED=true           # also turn on the background drawdown scanner
-```
+1. Pulls the current trending Solana memecoins from GMGN.
+2. Keeps only coins that are **deep in drawdown** (≥ 50% below ATH by default) **but
+   still active** — real trading fees, healthy market cap, and a sensible token age.
+3. **Screens the survivors** — mint/freeze renounced, low rug ratio and holder
+   concentration, acceptable snipers/bundlers, and no wash‑trading; smart‑money/KOL
+   activity is shown when present. Clearly unsafe coins are dropped; borderline ones
+   (including coins with no smart‑money signal) are flagged ⚠️ but still sent.
+4. Sends a card for each coin that passes (de‑duplicated so you aren't pinged twice for
+   the same coin within 24h).
 
-When enabled, the scanner periodically pulls trending Solana coins, keeps the ones that
-are deep in drawdown with real activity, screens them (renounce status, rug/holder
-concentration, snipers, bundlers, wash‑trading, smart‑money), and sends a screening
-alert for the ones that pass. Tune it with the `GMGN_*` variables in `.env.example`.
+Tune every threshold (drawdown %, min fees, market cap, token age, cadence, etc.) with
+the `GMGN_*` variables in [`.env.example`](./.env.example). `/gmgnstatus` shows what the
+last scan did, and `bun run gmgn:dryrun` runs one scan to the console without sending
+anything.
 
-**Meteora DLMM pool links** are shown automatically (public API, no key required); turn
-them off with `METEORA_LINKS_ENABLED=false`.
+**Meteora DLMM pool links** are added to every card automatically (public API, no key);
+turn them off with `METEORA_LINKS_ENABLED=false`.
 
 ---
 
@@ -141,12 +162,14 @@ The most common settings:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | — | **Required.** Your BotFather token. |
+| `GMGN_API_KEY` | — | **Required.** Powers the scanner + card data. |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | — | Allowed chat ids (keeps the bot private). |
-| `DEFAULT_DRAWDOWN_THRESHOLD_PCT` | 50 | Default alert threshold. |
-| `QUOTE` | native | `native` (SOL) or `usd` for the watch price/ATH. |
+| `TELEGRAM_CHAT_ID` | — | Optional chat pre‑seeded to receive scanner alerts. |
+| `GMGN_SCAN_INTERVAL_MS` | 300000 | How often the scanner runs (≥ 60000). |
+| `GMGN_DRAWDOWN_MIN_PCT` | 50 | Min % below ATH for the scanner to flag a coin. |
+| `DEFAULT_DRAWDOWN_THRESHOLD_PCT` | 50 | Default `/watch` alert threshold. |
 | `POLL_INTERVAL_MS` | 60000 | How often watched tokens are checked. |
-| `GMGN_API_KEY` | — | Enables GMGN card data and the scanner. |
-| `GMGN_SCAN_ENABLED` | false | Turn the background scanner on. |
+| `QUOTE` | native | `native` (SOL) or `usd` for the `/watch` price/ATH. |
 | `METEORA_LINKS_ENABLED` | true | Show Meteora DLMM pool links on cards. |
 
 👉 **Every available option is documented with comments in

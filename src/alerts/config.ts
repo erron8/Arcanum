@@ -57,13 +57,22 @@ export interface MeteoraConfig {
   timeoutMs: number;
 }
 
+/** Placeholder secrets shipped in .env.example — rejected so a half-configured copy fails fast. */
+export const TELEGRAM_TOKEN_PLACEHOLDERS = new Set([
+  'replace-with-your-botfather-token',
+  'your-botfather-token',
+]);
+export const GMGN_KEY_PLACEHOLDERS = new Set([
+  'replace-with-your-gmgn-openapi-key',
+  'your-gmgn-openapi-key',
+]);
+
 /**
- * Configuration for the optional GMGN drawdown scanner. The scanner is disabled
- * by default and never affects the existing /watch flow.
+ * Configuration for the GMGN drawdown scanner. The scanner is a core feature — it runs
+ * automatically and a valid GMGN_API_KEY is always required (validated at startup).
  */
 export interface GmgnConfig {
-  enabled: boolean;
-  apiKey: string; // empty when disabled; required (validated) when enabled
+  apiKey: string; // always required (validated, non-placeholder)
   baseUrl: string;
   scanIntervalMs: number;
   totalFeeMinSol: number;
@@ -124,7 +133,6 @@ function buildMeteoraConfig(env: Env): MeteoraConfig {
 /** Build the GMGN sub-config from the environment (pure; defaults for blanks). */
 function buildGmgnConfig(env: Env): GmgnConfig {
   return {
-    enabled: rawBool(env, 'GMGN_SCAN_ENABLED', false),
     apiKey: rawStr(env, 'GMGN_API_KEY', '').trim(),
     baseUrl: rawStr(env, 'GMGN_BASE_URL', GMGN_DEFAULT_BASE_URL).replace(/\/+$/, ''),
     scanIntervalMs: rawNum(env, 'GMGN_SCAN_INTERVAL_MS', 300_000),
@@ -219,6 +227,16 @@ export function validateEnv(env: Env): string[] {
     }
     return n;
   };
+
+  // Bot token: required, and must not be the .env.example placeholder.
+  const token = env.TELEGRAM_BOT_TOKEN;
+  if (token === undefined || token.trim() === '') {
+    errors.push('TELEGRAM_BOT_TOKEN is required.');
+  } else if (TELEGRAM_TOKEN_PLACEHOLDERS.has(token.trim())) {
+    errors.push(
+      'TELEGRAM_BOT_TOKEN is still the .env.example placeholder — set your real BotFather token.',
+    );
+  }
 
   requirePositive('POLL_INTERVAL_MS', 60_000, 1_000);
   requirePositive('ALERT_COOLDOWN_MS', 30 * 60_000, 0);
@@ -338,9 +356,9 @@ export function validateEnv(env: Env): string[] {
 }
 
 /**
- * Validate the GMGN scanner configuration. Numeric tunables are always range-checked
- * (their defaults are valid, so an unset GMGN section never produces errors). The API
- * key is required only when GMGN_SCAN_ENABLED=true, so disabling the scanner needs no key.
+ * Validate the GMGN scanner configuration. The drawdown scanner is a core, always-on
+ * feature, so a valid GMGN_API_KEY is always required — empty or the .env.example
+ * placeholder both fail startup. Numeric tunables are range-checked.
  */
 function validateGmgnEnv(
   env: Env,
@@ -351,16 +369,16 @@ function validateGmgnEnv(
     requireInt: (name: string, def: number, min: number) => number;
   },
 ): void {
-  const enabled = rawBool(env, 'GMGN_SCAN_ENABLED', false);
-
-  if (enabled) {
-    const key = env.GMGN_API_KEY;
-    if (key === undefined || key.trim() === '') {
-      errors.push('GMGN_API_KEY is required when GMGN_SCAN_ENABLED=true.');
-    }
+  const key = env.GMGN_API_KEY;
+  if (key === undefined || key.trim() === '') {
+    errors.push('GMGN_API_KEY is required (the drawdown scanner needs it to reach GMGN).');
+  } else if (GMGN_KEY_PLACEHOLDERS.has(key.trim())) {
+    errors.push(
+      'GMGN_API_KEY is still the .env.example placeholder — set your real GMGN OpenAPI key.',
+    );
   }
 
-  // Scan interval must never tick faster than once a minute, regardless of enablement.
+  // Scan interval must never tick faster than once a minute.
   v.requirePositive('GMGN_SCAN_INTERVAL_MS', 300_000, 60_000);
   v.requirePositive('GMGN_TOTAL_FEE_MIN_SOL', 30, 0);
   v.requirePositive('GMGN_MARKET_CAP_MIN_USD', 250_000, 0);

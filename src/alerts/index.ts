@@ -52,23 +52,18 @@ async function main(): Promise<void> {
   // Wire monitor → telegram (settable sink resolves the circular dependency).
   monitor.setSink(bot.buildSink());
 
-  // A GMGN client is built whenever an API key is configured. It powers two
-  // independent features: the optional scanner, and rich-layout enrichment for
-  // /watch alerts. Either can be active without the other.
-  const gmgnClient = config.gmgn.apiKey
-    ? new GmgnClient({
-        baseUrl: config.gmgn.baseUrl,
-        apiKey: config.gmgn.apiKey,
-        attempts: config.gmgn.attempts,
-        backoffMs: config.gmgn.backoffMs,
-        timeoutMs: config.gmgn.timeoutMs,
-      })
-    : null;
+  // GMGN client — a valid GMGN_API_KEY is required at startup, so this is always built.
+  // It powers both the drawdown scanner and rich-layout enrichment for /watch + /check.
+  const gmgnClient = new GmgnClient({
+    baseUrl: config.gmgn.baseUrl,
+    apiKey: config.gmgn.apiKey,
+    attempts: config.gmgn.attempts,
+    backoffMs: config.gmgn.backoffMs,
+    timeoutMs: config.gmgn.timeoutMs,
+  });
+  bot.setGmgnEnricher(makeGmgnEnricher(gmgnClient));
 
-  // Enrich /watch alerts with the rich GMGN layout when a client is available.
-  if (gmgnClient) bot.setGmgnEnricher(makeGmgnEnricher(gmgnClient));
-
-  // Meteora DLMM pool links (public API, no key) — added to both alert types.
+  // Meteora DLMM pool links (public API, no key) — added to every alert/card.
   let meteoraLinker: MeteoraLinker | undefined;
   if (config.meteora.enabled) {
     const meteora = new MeteoraClient({
@@ -82,22 +77,18 @@ async function main(): Promise<void> {
     bot.setMeteoraLinker(meteoraLinker);
   }
 
-  // Optional GMGN drawdown scanner — disabled by default; never affects /watch.
-  let gmgnScanner: GmgnScanner | null = null;
-  if (config.gmgn.enabled && gmgnClient) {
-    const screenedStore = new GmgnScreenedStore(config.gmgn.screenedPath);
-    await screenedStore.init();
-    gmgnScanner = new GmgnScanner(config.gmgn, {
-      client: gmgnClient,
-      store: screenedStore,
-      notify: (messages) => bot.notify(messages),
-      watchStore: config.gmgn.autoWatch ? store : undefined,
-      meteora: meteoraLinker,
-    });
-    // Enable the manual /scan command (runs one cycle on demand) + /gmgnstatus.
-    bot.setGmgnScan(() => gmgnScanner!.scanNow());
-    bot.setGmgnStatus(() => gmgnScanner!.status());
-  }
+  // GMGN drawdown scanner — a core, always-on feature.
+  const screenedStore = new GmgnScreenedStore(config.gmgn.screenedPath);
+  await screenedStore.init();
+  const gmgnScanner = new GmgnScanner(config.gmgn, {
+    client: gmgnClient,
+    store: screenedStore,
+    notify: (messages) => bot.notify(messages),
+    watchStore: config.gmgn.autoWatch ? store : undefined,
+    meteora: meteoraLinker,
+  });
+  bot.setGmgnScan(() => gmgnScanner.scanNow());
+  bot.setGmgnStatus(() => gmgnScanner.status());
 
   let shuttingDown = false;
   const shutdown = async (signal: string, code = 0): Promise<void> => {
@@ -137,12 +128,20 @@ async function main(): Promise<void> {
   monitor.start();
 
   // Start the GMGN scanner only after Telegram is live so its alerts have a delivery path.
-  if (gmgnScanner) {
-    gmgnScanner.start();
-    console.log(
-      `[index] GMGN scanner enabled · scanInterval=${config.gmgn.scanIntervalMs}ms · ` +
-        `feeMin=${config.gmgn.totalFeeMinSol} SOL · mcapMin=$${config.gmgn.marketCapMinUsd} · ` +
-        `drawdownMin=${config.gmgn.drawdownMinPct}% · autoWatch=${config.gmgn.autoWatch}`,
+  gmgnScanner.start();
+  console.log(
+    `[index] GMGN scanner running · scanInterval=${config.gmgn.scanIntervalMs}ms · ` +
+      `feeMin=${config.gmgn.totalFeeMinSol} SOL · mcapMin=$${config.gmgn.marketCapMinUsd} · ` +
+      `drawdownMin=${config.gmgn.drawdownMinPct}% · autoWatch=${config.gmgn.autoWatch}`,
+  );
+
+  // The scanner needs at least one subscriber to deliver to. Warn loudly if there are
+  // none yet — automatic alerts will be found but have nowhere to go until someone
+  // sends /start (or TELEGRAM_CHAT_ID is set).
+  if (bot.subscriberIds().length === 0) {
+    console.warn(
+      '[index] No subscribers yet — automatic scanner alerts have nowhere to send. ' +
+        'Send /start to the bot (or set TELEGRAM_CHAT_ID) to receive them.',
     );
   }
 

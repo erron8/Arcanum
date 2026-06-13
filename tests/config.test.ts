@@ -1,10 +1,11 @@
 import { test, expect, describe } from 'bun:test';
 import { buildConfig, validateEnv } from '../src/alerts/config';
 
-// Helper: most "valid config" cases need the fail-closed auth satisfied. Default
-// to open mode so each test can focus on the field it's exercising.
+// Helper: a "valid config" needs a bot token, the fail-closed auth satisfied, and a
+// GMGN key (the scanner always requires one). Provide all three so each test can focus
+// on the single field it's exercising.
 const ok = (env: Record<string, string | undefined> = {}): string[] =>
-  validateEnv({ ALLOW_OPEN_BOT: 'true', ...env });
+  validateEnv({ TELEGRAM_BOT_TOKEN: 't', ALLOW_OPEN_BOT: 'true', GMGN_API_KEY: 'k', ...env });
 
 describe('validateEnv', () => {
   test('clean env yields no errors', () => {
@@ -25,10 +26,11 @@ describe('validateEnv', () => {
   test('fails closed when neither allowlist nor ALLOW_OPEN_BOT is set', () => {
     const errs = validateEnv({});
     expect(errs.some((e) => e.includes('ALLOW_OPEN_BOT'))).toBe(true);
-    // An allowlist alone satisfies it…
-    expect(validateEnv({ TELEGRAM_ALLOWED_CHAT_IDS: '123' })).toEqual([]);
+    const base = { TELEGRAM_BOT_TOKEN: 't', GMGN_API_KEY: 'k' };
+    // An allowlist alone satisfies auth…
+    expect(validateEnv({ ...base, TELEGRAM_ALLOWED_CHAT_IDS: '123' })).toEqual([]);
     // …and so does the explicit open-mode opt-in.
-    expect(validateEnv({ ALLOW_OPEN_BOT: 'true' })).toEqual([]);
+    expect(validateEnv({ ...base, ALLOW_OPEN_BOT: 'true' })).toEqual([]);
   });
 
   test('rejects zero / negative poll interval', () => {
@@ -73,7 +75,9 @@ describe('validateEnv', () => {
     expect(validateEnv({ TELEGRAM_ALLOWED_CHAT_IDS: 'abc' }).length).toBeGreaterThan(0);
     expect(validateEnv({ TELEGRAM_ALLOWED_CHAT_IDS: '1, two, 3' }).length).toBeGreaterThan(0);
     expect(validateEnv({ TELEGRAM_ALLOWED_CHAT_IDS: '1.5' }).length).toBeGreaterThan(0);
-    expect(validateEnv({ TELEGRAM_ALLOWED_CHAT_IDS: '1, 2, -300' })).toEqual([]); // allowlist satisfies auth
+    expect(
+      validateEnv({ TELEGRAM_BOT_TOKEN: 't', GMGN_API_KEY: 'k', TELEGRAM_ALLOWED_CHAT_IDS: '1, 2, -300' }),
+    ).toEqual([]); // allowlist satisfies auth
   });
 
   test('rejects POLL_CONCURRENCY < 1 and non-integers', () => {
@@ -161,9 +165,8 @@ describe('buildConfig', () => {
     expect(buildConfig({ TELEGRAM_CHAT_ID: 'bad' }).telegramChatId).toBeUndefined();
   });
 
-  test('GMGN scanner is disabled by default with sane defaults', () => {
+  test('GMGN scanner has sane defaults', () => {
     const g = buildConfig({}).gmgn;
-    expect(g.enabled).toBe(false);
     expect(g.autoWatch).toBe(false);
     expect(g.apiKey).toBe('');
     expect(g.scanIntervalMs).toBe(300_000);
@@ -179,23 +182,39 @@ describe('buildConfig', () => {
   });
 
   test('GMGN flags parse from env', () => {
-    const g = buildConfig({ GMGN_SCAN_ENABLED: 'true', GMGN_AUTO_WATCH: 'true', GMGN_API_KEY: ' k ' }).gmgn;
-    expect(g.enabled).toBe(true);
+    const g = buildConfig({ GMGN_AUTO_WATCH: 'true', GMGN_API_KEY: ' k ' }).gmgn;
     expect(g.autoWatch).toBe(true);
     expect(g.apiKey).toBe('k'); // trimmed
   });
 });
 
 describe('validateEnv GMGN', () => {
-  test('unset GMGN section is valid (defaults pass)', () => {
+  test('a valid config with a GMGN key passes', () => {
     expect(ok()).toEqual([]);
   });
 
-  test('GMGN_API_KEY is required only when the scanner is enabled', () => {
-    expect(ok({ GMGN_SCAN_ENABLED: 'true' }).some((e) => e.includes('GMGN_API_KEY'))).toBe(true);
-    expect(ok({ GMGN_SCAN_ENABLED: 'true', GMGN_API_KEY: 'secret' })).toEqual([]);
-    // Disabled scanner needs no key.
-    expect(ok({ GMGN_SCAN_ENABLED: 'false' })).toEqual([]);
+  test('GMGN_API_KEY is always required (scanner is core)', () => {
+    const base = { TELEGRAM_BOT_TOKEN: 't', ALLOW_OPEN_BOT: 'true' };
+    // No key → error.
+    expect(validateEnv(base).some((e) => e.includes('GMGN_API_KEY'))).toBe(true);
+    // A real key → valid.
+    expect(validateEnv({ ...base, GMGN_API_KEY: 'secret' })).toEqual([]);
+  });
+
+  test('rejects the .env.example placeholder secrets', () => {
+    const base = { ALLOW_OPEN_BOT: 'true' };
+    expect(
+      validateEnv({ ...base, TELEGRAM_BOT_TOKEN: 'replace-with-your-botfather-token', GMGN_API_KEY: 'k' })
+        .some((e) => e.includes('TELEGRAM_BOT_TOKEN')),
+    ).toBe(true);
+    expect(
+      validateEnv({ ...base, TELEGRAM_BOT_TOKEN: 't', GMGN_API_KEY: 'replace-with-your-gmgn-openapi-key' })
+        .some((e) => e.includes('GMGN_API_KEY')),
+    ).toBe(true);
+    expect(
+      validateEnv({ ...base, TELEGRAM_BOT_TOKEN: 't', GMGN_API_KEY: 'your-gmgn-openapi-key' })
+        .some((e) => e.includes('GMGN_API_KEY')),
+    ).toBe(true);
   });
 
   test('scan interval must be >= 60000', () => {

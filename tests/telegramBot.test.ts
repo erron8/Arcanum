@@ -407,7 +407,7 @@ describe('TelegramTransport commands (real handler path)', () => {
     const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
     const sent = recorder(bot);
     await bot.handleUpdate(cmdUpdate(7, '/scan'));
-    expect(sent.some((m) => m.text.includes('not enabled'))).toBe(true);
+    expect(sent.some((m) => m.text.includes('unavailable'))).toBe(true);
   });
 
   test('/scan runs a cycle and reports the summary + base-drop reasons', async () => {
@@ -441,7 +441,7 @@ describe('TelegramTransport commands (real handler path)', () => {
     const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
     const sent = recorder(bot);
     await bot.handleUpdate(cmdUpdate(7, '/gmgnstatus'));
-    expect(sent.some((m) => m.text.includes('not enabled'))).toBe(true);
+    expect(sent.some((m) => m.text.includes('unavailable'))).toBe(true);
   });
 
   test('/gmgnstatus shows last summary, base-drops, delivered, and error', async () => {

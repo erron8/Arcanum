@@ -1,9 +1,9 @@
 {
-  "name": "ath-drawdown-bot",
+  "name": "arcanum",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "ATH Drawdown indicator + Telegram alerting bot (Jupiter datapi, grammY)",
+  "description": "Arcanum — a Telegram bot that automatically and manually tracks ATH drawdown on trending Solana memecoins (GMGN, Jupiter, Meteora; grammY)",
   "scripts": {
     "start": "bun run src/alerts/index.ts",
     "typecheck": "tsc --noEmit",
