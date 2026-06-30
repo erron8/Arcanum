@@ -15,6 +15,11 @@ export function meteoraPoolUrl(poolAddress: string): string {
 export interface MeteoraPoolLink {
   poolAddress: string;
   /**
+   * Symbol of the looked-up token side when Meteora includes it. Some pools omit
+   * this, so alert rendering still falls back to GMGN/Jupiter metadata first.
+   */
+  baseSymbol?: string;
+  /**
    * Symbol of the OTHER side of the pair (the quote — SOL/USDC/etc.). The base side is
    * always the token being looked up, so the renderer labels pools as `<token>/<quote>`
    * (Meteora sometimes omits the base token's symbol, e.g. for DBC pools).
@@ -191,11 +196,13 @@ function toLink(p: MeteoraPoolRow, mint: string): MeteoraPoolLink | null {
   if (!p.address) return null;
   // The quote side is whichever side ISN'T the token we looked up; its symbol is
   // usually reliable (SOL/USDC) even when Meteora omits the base token's symbol.
+  const baseSide = p.token_x?.address === mint ? p.token_x : p.token_y;
   const quoteSide = p.token_x?.address === mint ? p.token_y : p.token_x;
   const quoteSymbol =
     quoteSide?.symbol || (quoteSide?.address ? shortAddr(quoteSide.address) : undefined);
   return {
     poolAddress: p.address,
+    baseSymbol: baseSide?.symbol?.trim() || undefined,
     quoteSymbol,
     volume24h: toNum(p.volume?.['24h']),
     tvl: toNum(p.tvl),

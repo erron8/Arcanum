@@ -11,6 +11,7 @@ import type {
 export interface GmgnFetchResponse {
   ok: boolean;
   status: number;
+  headers?: { get(name: string): string | null };
   json(): Promise<unknown>;
   text(): Promise<string>;
 }
@@ -44,6 +45,10 @@ export interface GmgnClientOptions {
   attempts?: number;
   backoffMs?: number;
   timeoutMs?: number;
+  /** Minimum delay between GMGN HTTP attempts made by this client instance. */
+  minIntervalMs?: number;
+  /** Cooldown applied after a 429 when Retry-After is absent. */
+  rateLimitCooldownMs?: number;
 }
 
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -114,6 +119,15 @@ function asArray<T>(x: unknown): T[] {
   return Array.isArray(x) ? (x as T[]) : [];
 }
 
+function retryAfterMs(res: GmgnFetchResponse, nowMs: number): number | undefined {
+  const raw = res.headers?.get('retry-after') ?? res.headers?.get('Retry-After');
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(raw);
+  return Number.isFinite(at) && at > nowMs ? at - nowMs : undefined;
+}
+
 /**
  * GMGN OpenAPI client (read endpoints only).
  *
@@ -127,10 +141,15 @@ export class GmgnClient {
   private readonly attempts: number;
   private readonly backoffMs: number;
   private readonly timeoutMs: number;
+  private readonly minIntervalMs: number;
+  private readonly rateLimitCooldownMs: number;
   private readonly fetchImpl: GmgnFetch;
   private readonly uuid: () => string;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
+  private nextRequestAt = 0;
+  private cooldownUntil = 0;
+  private paceChain: Promise<void> = Promise.resolve();
 
   constructor(opts: GmgnClientOptions, deps: GmgnClientDeps = {}) {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, '');
@@ -138,6 +157,8 @@ export class GmgnClient {
     this.attempts = Math.max(1, opts.attempts ?? 3);
     this.backoffMs = Math.max(0, opts.backoffMs ?? 500);
     this.timeoutMs = Math.max(1, opts.timeoutMs ?? 8_000);
+    this.minIntervalMs = Math.max(0, opts.minIntervalMs ?? 1_000);
+    this.rateLimitCooldownMs = Math.max(0, opts.rateLimitCooldownMs ?? 20_000);
     this.fetchImpl = deps.fetch ?? defaultFetch;
     this.uuid = deps.uuid ?? (() => crypto.randomUUID());
     this.now = deps.now ?? (() => Date.now());
@@ -172,6 +193,30 @@ export class GmgnClient {
     return { url, init };
   }
 
+  /**
+   * Serialize outbound attempts through a small client-side pace gate. GMGN's API
+   * returns 429s under bursty load; this smooths scanner + /check traffic without
+   * changing call sites or dropping best-effort enrichments.
+   */
+  private async waitForPace(): Promise<void> {
+    const run = this.paceChain.then(async () => {
+      const now = this.now();
+      const waitMs = Math.max(0, this.nextRequestAt - now, this.cooldownUntil - now);
+      if (waitMs > 0) await this.sleep(waitMs);
+      const afterWait = this.now();
+      const base = Math.max(afterWait, this.nextRequestAt, this.cooldownUntil);
+      this.nextRequestAt = base + this.minIntervalMs;
+    });
+    this.paceChain = run.catch(() => {});
+    await run;
+  }
+
+  private noteRateLimit(res: GmgnFetchResponse): void {
+    const now = this.now();
+    const retryMs = retryAfterMs(res, now) ?? this.rateLimitCooldownMs;
+    this.cooldownUntil = Math.max(this.cooldownUntil, now + retryMs);
+  }
+
   /** Issue a request with timeout + retry/backoff, returning the parsed JSON. */
   private async request(
     path: string,
@@ -183,6 +228,7 @@ export class GmgnClient {
   ): Promise<unknown> {
     let lastErr: unknown;
     for (let attempt = 0; attempt < this.attempts; attempt++) {
+      await this.waitForPace();
       // Fresh timestamp + client_id per attempt (the server rejects ±5s drift / replays).
       const { url, init } = this.buildRequest(path, opts);
       const controller = new AbortController();
@@ -194,6 +240,7 @@ export class GmgnClient {
         }
         // Retry transient server/throttle statuses; fail fast on 4xx (except 429).
         if (res.status === 429 || res.status >= 500) {
+          if (res.status === 429) this.noteRateLimit(res);
           lastErr = new Error(`GMGN ${path} responded ${res.status}`);
         } else {
           throw new GmgnNonRetryableError(`GMGN ${path} responded ${res.status}`);

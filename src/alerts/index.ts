@@ -60,6 +60,8 @@ async function main(): Promise<void> {
     attempts: config.gmgn.attempts,
     backoffMs: config.gmgn.backoffMs,
     timeoutMs: config.gmgn.timeoutMs,
+    minIntervalMs: config.gmgn.requestIntervalMs,
+    rateLimitCooldownMs: config.gmgn.rateLimitCooldownMs,
   });
   bot.setGmgnEnricher(makeGmgnEnricher(gmgnClient));
 

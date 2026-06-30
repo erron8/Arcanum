@@ -89,6 +89,8 @@ export interface GmgnConfig {
   attempts: number;
   backoffMs: number;
   timeoutMs: number;
+  requestIntervalMs: number;
+  rateLimitCooldownMs: number;
 }
 
 export interface AppConfig {
@@ -150,6 +152,8 @@ function buildGmgnConfig(env: Env): GmgnConfig {
     attempts: rawNum(env, 'FETCH_ATTEMPTS', 3),
     backoffMs: rawNum(env, 'FETCH_BACKOFF_MS', 500),
     timeoutMs: rawNum(env, 'FETCH_TIMEOUT_MS', 8_000),
+    requestIntervalMs: rawNum(env, 'GMGN_REQUEST_INTERVAL_MS', 1_000),
+    rateLimitCooldownMs: rawNum(env, 'GMGN_429_COOLDOWN_MS', 20_000),
   };
 }
 
@@ -386,6 +390,8 @@ function validateGmgnEnv(
   v.requirePositive('GMGN_MIN_TOKEN_AGE_HOURS', 4, 0);
   v.requirePositive('GMGN_MAX_TOKEN_AGE_DAYS', 14, 0);
   v.requireInt('GMGN_DEDUPE_MS', 86_400_000, 0);
+  v.requirePositive('GMGN_REQUEST_INTERVAL_MS', 1_000, 0);
+  v.requirePositive('GMGN_429_COOLDOWN_MS', 20_000, 0);
 
   // rank endpoint returns at most 100 rows.
   const limit = v.requireInt('GMGN_SCAN_LIMIT', 100, 1);

@@ -26,10 +26,12 @@ export type GmgnScanTrigger = () => Promise<CycleSummary | null>;
 export type GmgnStatusProvider = () => GmgnScanStatus;
 
 /**
- * Default cap on how long a /watch alert waits for GMGN + Meteora enrichment before
- * sending the basic alert anyway. Critical alerts must not be delayed by slow lookups.
+ * Default cap on how long an alert waits for GMGN + Meteora enrichment before
+ * sending the basic alert anyway. GMGN requests are paced, so the timeout needs
+ * enough room for token info + security/holder/trader enrichment.
  */
-const ENRICH_TIMEOUT_MS = 2_500;
+const ENRICH_TIMEOUT_MS = 12_000;
+const CHECK_ENRICH_TIMEOUT_MS = 12_000;
 
 /** base58, 32–44 chars (Solana mint). */
 const MINT_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -339,25 +341,37 @@ export class TelegramTransport {
     };
   }
 
-  /**
-   * Build the rich view for a /watch alert. The watch framing (trigger drawdown,
-   * threshold, price/ATH in the configured quote) always comes from the alert payload;
-   * GMGN enrichment only fills the extra display fields and the symbol/name fallback.
-   */
+  /** Build the rich view for a /watch alert, preferring GMGN's USD market data. */
   private async buildWatchView(a: AlertPayload): Promise<RichTokenView> {
     const { extra, pools } = await this.fetchEnrichment(a.mint);
+    const drawdownPct = a.drawdownPct;
+    let fdvAthUsd = extra.fdvAthUsd;
+    if (
+      fdvAthUsd === undefined &&
+      extra.fdvUsd !== undefined &&
+      drawdownPct < 100
+    ) {
+      fdvAthUsd = extra.fdvUsd / (1 - drawdownPct / 100);
+    }
+    const hasGmgnMarketData =
+      extra.priceUsd !== undefined ||
+      extra.athUsd !== undefined ||
+      extra.fdvUsd !== undefined ||
+      fdvAthUsd !== undefined;
+
     return {
       ...extra,
       kind: 'watch',
       mint: a.mint,
       symbol: a.symbol ?? extra.symbol,
       chain: 'Solana',
-      priceUsd: a.price,
-      athUsd: a.ath,
-      drawdownPct: a.drawdownPct,
+      priceUsd: extra.priceUsd ?? (hasGmgnMarketData ? undefined : a.price),
+      athUsd: extra.athUsd ?? (hasGmgnMarketData ? undefined : a.ath),
+      fdvAthUsd,
+      drawdownPct,
       threshold: a.threshold,
       meteoraPools: pools.length > 0 ? pools : undefined,
-      quote: this.cfg.quote,
+      quote: hasGmgnMarketData ? 'usd' : this.cfg.quote,
     };
   }
 
@@ -369,8 +383,9 @@ export class TelegramTransport {
    */
   private async fetchEnrichment(
     mint: string,
+    timeoutMs = this.enrichTimeoutMs,
   ): Promise<{ extra: Partial<RichTokenView>; pools: MeteoraPoolLink[] }> {
-    const ms = this.enrichTimeoutMs;
+    const ms = timeoutMs;
     const extraP: Promise<Partial<RichTokenView> | null> = this.gmgnEnrich
       ? withTimeout(
           this.gmgnEnrich(mint).catch((err) => {
@@ -1004,36 +1019,41 @@ export class TelegramTransport {
    * merges GMGN display fields + Meteora pools; best-effort, so partial data still shows.
    */
   async processCheck(chatId: number, mint: string, replyTo?: number): Promise<void> {
-    const [snap, { extra, pools }] = await Promise.all([
+    const [snap, { extra, pools }, fallbackSymbol] = await Promise.all([
       this.monitor.snapshot(mint).catch((err) => {
         console.error(`[telegram] /check snapshot ${mint} failed:`, err);
         return null;
       }),
-      this.fetchEnrichment(mint),
+      this.fetchEnrichment(mint, CHECK_ENRICH_TIMEOUT_MS),
+      this.fetchSymbol(mint).catch(() => undefined),
     ]);
 
-    // Prefer GMGN USD data so the card is internally consistent: USD price + USD
-    // market caps, and a drawdown computed from the USD ATH (matches the FDV ⇨ ATH
-    // projection). Fall back to the Jupiter snapshot only when GMGN has no price.
-    let priceUsd = extra.priceUsd;
-    let athUsd = extra.athUsd;
-    let drawdownPct: number | undefined;
-    let quote: 'native' | 'usd' = 'usd';
-    if (priceUsd !== undefined) {
-      if (athUsd !== undefined && athUsd > 0) {
-        drawdownPct = Math.max(0, ((athUsd - priceUsd) / athUsd) * 100);
-      } else if (snap) {
-        drawdownPct = snap.drawdownPct;
-      }
-    } else if (snap) {
-      priceUsd = snap.price;
-      athUsd = snap.ath;
-      drawdownPct = snap.drawdownPct;
-      quote = this.cfg.quote;
+    // /check is market-cap-first: GMGN supplies USD price/market-cap fields, while
+    // Jupiter's chart snapshot is only a drawdown fallback so native SOL prices do
+    // not leak into the full token card.
+    const priceUsd = extra.priceUsd;
+    const athUsd = extra.athUsd;
+    let drawdownPct = extra.drawdownPct;
+    if (drawdownPct === undefined && priceUsd !== undefined && athUsd !== undefined && athUsd > 0) {
+      drawdownPct = Math.max(0, ((athUsd - priceUsd) / athUsd) * 100);
+    }
+    if (drawdownPct === undefined && snap) drawdownPct = snap.drawdownPct;
+
+    let fdvAthUsd = extra.fdvAthUsd;
+    if (
+      fdvAthUsd === undefined &&
+      extra.fdvUsd !== undefined &&
+      drawdownPct !== undefined &&
+      drawdownPct < 100
+    ) {
+      fdvAthUsd = extra.fdvUsd / (1 - drawdownPct / 100);
     }
 
     const hasAnything =
-      priceUsd !== undefined || pools.length > 0 || Object.keys(extra).length > 0;
+      snap !== null ||
+      fallbackSymbol !== undefined ||
+      pools.length > 0 ||
+      Object.keys(extra).length > 0;
     if (!hasAnything) {
       await this.sendDirect(
         chatId,
@@ -1047,13 +1067,14 @@ export class TelegramTransport {
       ...extra,
       kind: 'check',
       mint,
-      symbol: extra.symbol,
+      symbol: extra.symbol ?? fallbackSymbol,
       chain: 'Solana',
       priceUsd,
       athUsd,
+      fdvAthUsd,
       drawdownPct,
       meteoraPools: pools.length > 0 ? pools : undefined,
-      quote,
+      quote: 'usd',
     };
     const messages = formatRichMessages([view]);
     for (const m of messages) await this.sendDirect(chatId, m, replyTo);

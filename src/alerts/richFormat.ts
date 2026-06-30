@@ -77,6 +77,25 @@ function shortAddr(a: string): string {
   return a.length > 8 ? `${a.slice(0, 4)}…${a.slice(-4)}` : a;
 }
 
+const MINT_LIKE_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+function cleanTokenLabel(s: string | undefined, mint: string): string | undefined {
+  const t = s?.trim();
+  const shortAscii = mint.length > 8 ? `${mint.slice(0, 4)}...${mint.slice(-4)}` : mint;
+  if (!t || t === mint || t === shortMint(mint) || t === shortAscii || MINT_LIKE_RE.test(t)) {
+    return undefined;
+  }
+  return t;
+}
+
+function firstPoolBaseSymbol(v: RichTokenView): string | undefined {
+  for (const p of v.meteoraPools ?? []) {
+    const label = cleanTokenLabel(p.baseSymbol, v.mint);
+    if (label) return label;
+  }
+  return undefined;
+}
+
 /** Compact number label (e.g. 1.2M, 340.0K). Returns undefined for absent/invalid. */
 function fmtCompact(n: number | undefined): string | undefined {
   if (n === undefined || !Number.isFinite(n) || n < 0) return undefined;
@@ -172,7 +191,10 @@ export function formatRichBlock(v: RichTokenView): string {
   const emoji = v.kind === 'gmgn' ? VERDICT_EMOJI[v.verdict ?? 'PASS'] : v.kind === 'check' ? '🔍' : '🔻';
   // The token NAME links to its GMGN page (primary trading terminal).
   const gmgnUrl = `https://gmgn.ai/sol/token/${v.mint}`;
-  const nameText = `*${esc(clamp(v.name ?? v.symbol ?? shortMint(v.mint)))}*`;
+  const symbolLabel = cleanTokenLabel(v.symbol, v.mint);
+  const poolSymbol = firstPoolBaseSymbol(v);
+  const displayName = cleanTokenLabel(v.name, v.mint) ?? symbolLabel ?? poolSymbol ?? shortMint(v.mint);
+  const nameText = `*${esc(clamp(displayName))}*`;
   const gmgnDest = safeLinkDest(gmgnUrl);
   const nameLinked = gmgnDest ? `[${nameText}](${gmgnDest})` : nameText;
 
@@ -190,15 +212,15 @@ export function formatRichBlock(v: RichTokenView): string {
   // Ticker at the end as a plain-text cashtag (UPPERCASE) — Telegram auto-detects
   // cashtags and tapping one searches the chat for that ticker. It must stay plain
   // text (no link/code entity) for that detection to fire.
-  const cashtag = v.symbol ? `  ${esc(`$${clamp(v.symbol).toUpperCase()}`)}` : '';
+  const cashtag = symbolLabel ? `  ${esc(`$${clamp(symbolLabel).toUpperCase()}`)}` : '';
 
   const title = [`${emoji} ${nameLinked}${mcapTag}${tag}${cashtag}`];
 
   // --- ATH (market cap at ATH), its own section right under the title ---
   const ath: string[] = [];
   if (fdvAth) {
-    ath.push(`🏔 ATH: *${esc(fdvAth)}*`);
-  } else if (v.athUsd !== undefined) {
+    ath.push(`🏔 ATH Marketcap: *${esc(fdvAth)}*`);
+  } else if (v.athUsd !== undefined && v.kind !== 'check') {
     ath.push(`🏔 ATH: *${esc(fmtPrice(v.athUsd))}* ${v.quote === 'native' ? 'SOL' : 'USD'}`);
   }
 
@@ -206,12 +228,12 @@ export function formatRichBlock(v: RichTokenView): string {
   const market: string[] = [];
   const chain = v.chain ?? 'Solana';
   market.push(`🌐 ${v.platform ? `${esc(chain)} @ ${esc(clamp(v.platform))}` : esc(chain)}`);
-  if (v.priceUsd !== undefined) {
+  if (v.priceUsd !== undefined && !(v.kind === 'check' && (fdvNow || fdvAth))) {
     market.push(`💰 ${v.quote === 'native' ? 'SOL' : 'USD'}: ${esc(fmtPrice(v.priceUsd))}`);
   }
   if (fdvNow || fdvAth) {
     const proj = fdvNow && fdvAth ? `${esc(fdvNow)} ⇨ ${esc(fdvAth)}` : esc((fdvNow ?? fdvAth)!);
-    market.push(`💎 FDV: ${proj}`);
+    market.push(`💎 Marketcap: ${proj}`);
   }
   const liq = fmtUsd(v.liquidityUsd);
   if (liq) {
@@ -270,7 +292,7 @@ export function formatRichBlock(v: RichTokenView): string {
   // --- Meteora DLMM pools as a numbered list (top pools by TVL) ---
   const meteora: string[] = [];
   if (v.meteoraPools && v.meteoraPools.length > 0) {
-    const baseSymbol = v.symbol ?? shortMint(v.mint);
+    const baseSymbol = symbolLabel ?? poolSymbol ?? shortMint(v.mint);
     const entries = v.meteoraPools
       .map((p) => meteoraEntry(p, baseSymbol))
       .filter((s): s is string => s !== null);

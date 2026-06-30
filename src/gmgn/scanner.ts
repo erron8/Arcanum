@@ -421,7 +421,11 @@ export function buildGmgnDisplay(inp: GmgnDisplayInputs): Partial<RichTokenView>
     (price !== undefined && supply !== undefined ? price * supply : undefined);
   const athPrice = inp.base?.athPrice ?? infoPrice(info?.ath_price);
   const fdvAthUsd =
-    athPrice !== undefined && supply !== undefined ? athPrice * supply : undefined;
+    athPrice !== undefined && supply !== undefined
+      ? athPrice * supply
+      : fdvUsd !== undefined && price !== undefined && price > 0 && athPrice !== undefined
+        ? fdvUsd * (athPrice / price)
+        : undefined;
 
   const recent = inp.recentKline ?? [];
   // GMGN's `price` field is often a rich object carrying 24h volume / buy-sell stats.

@@ -61,7 +61,7 @@ describe('formatRichBlock — GMGN', () => {
     expect(b).toContain('$WIF'); // ticker as a cashtag (uppercase) at the title end
     expect(b).toContain('WARN');
     expect(b).toContain('Solana @ Pump');
-    expect(b).toContain('FDV');
+    expect(b).toContain('Marketcap');
     expect(b).toContain('⇨'); // now → ATH projection
     expect(b).toContain('Liq:');
     expect(b).toContain('SM holding 4');
@@ -71,8 +71,8 @@ describe('formatRichBlock — GMGN', () => {
     expect(b).toContain('🐦 X'); // social
     expect(b).toContain('\n\n'); // sections are separated by a blank line
     // Title carries the current market cap (bold); ATH line shows the market cap at ATH (bold).
-    expect(b).toContain('\\[*$980\\.0K*\\]'); // current FDV in the title bracket, bold
-    expect(b).toContain('🏔 ATH: *$2\\.65M*'); // ATH shown as market cap, bold
+    expect(b).toContain('\\[*$980\\.0K*\\]'); // current market cap in the title bracket, bold
+    expect(b).toContain('🏔 ATH Marketcap: *$2\\.65M*'); // ATH shown as market cap, bold
     expect(b).toContain('⬇️*62\\.80%*'); // drawdown bold in the tag
     expect(b).not.toContain('1H:'); // 1H line removed
   });
@@ -143,10 +143,46 @@ describe('formatRichBlock — GMGN', () => {
     expect(b).not.toContain('\\-USDC');
   });
 
+  test('Meteora base symbol is used when token metadata is missing', () => {
+    const b = formatRichBlock({
+      kind: 'check',
+      mint: MINT,
+      drawdownPct: 38.2,
+      meteoraPools: [
+        {
+          poolAddress: 'POOL1',
+          baseSymbol: 'PENGU',
+          quoteSymbol: 'SOL',
+          binStep: 80,
+          baseFeePct: 0.8,
+          url: 'https://app.meteora.ag/dlmm/POOL1',
+        },
+      ],
+    });
+    expect(b).toContain(`[*PENGU*](https://gmgn.ai/sol/token/${MINT})`);
+    expect(b).toContain('1\\. [PENGU/SOL 80/0\\.8%]');
+    expect(b).not.toContain('So11…1112/SOL');
+  });
+
+  test('contract-address-looking symbols are ignored for title, cashtag, and pools', () => {
+    const b = formatRichBlock(
+      gmgnView({
+        name: undefined,
+        symbol: MINT,
+        meteoraPools: [
+          { poolAddress: 'POOL1', quoteSymbol: 'SOL', url: 'https://app.meteora.ag/dlmm/POOL1' },
+        ],
+      }),
+    );
+    expect(b).toContain(`[*So11…1112*](https://gmgn.ai/sol/token/${MINT})`);
+    expect(b).not.toContain('$SO111');
+    expect(b).toContain('1\\. [So11…1112/SOL]');
+  });
+
   test('omits fields that are absent (no crash, no doubled blank lines)', () => {
     const b = formatRichBlock({ kind: 'gmgn', mint: MINT, verdict: 'PASS' });
     expect(b).toContain(MINT);
-    expect(b).not.toContain('FDV');
+    expect(b).not.toContain('Marketcap');
     expect(b).not.toContain('Liq:');
     // Empty sections are dropped, so there is never a doubled (3+ newline) gap.
     expect(b).not.toMatch(/\n\n\n/);

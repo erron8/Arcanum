@@ -179,6 +179,8 @@ describe('buildConfig', () => {
     expect(g.scanConcurrency).toBe(4);
     expect(g.dedupeMs).toBe(86_400_000);
     expect(g.baseUrl).toBe('https://openapi.gmgn.ai');
+    expect(g.requestIntervalMs).toBe(1_000);
+    expect(g.rateLimitCooldownMs).toBe(20_000);
   });
 
   test('GMGN flags parse from env', () => {
@@ -238,6 +240,12 @@ describe('validateEnv GMGN', () => {
     expect(ok({ GMGN_DRAWDOWN_MIN_PCT: '150' }).length).toBeGreaterThan(0);
     expect(ok({ GMGN_TOTAL_FEE_MIN_SOL: 'abc' }).length).toBeGreaterThan(0);
     expect(ok({ GMGN_MARKET_CAP_MIN_USD: '-1' }).length).toBeGreaterThan(0);
+  });
+
+  test('GMGN rate-limit pacing knobs must be finite and non-negative', () => {
+    expect(ok({ GMGN_REQUEST_INTERVAL_MS: '-1' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_429_COOLDOWN_MS: '-1' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_REQUEST_INTERVAL_MS: '0', GMGN_429_COOLDOWN_MS: '0' })).toEqual([]);
   });
 
   test('min age must be below max age', () => {

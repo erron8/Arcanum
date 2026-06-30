@@ -59,6 +59,8 @@ async function main(): Promise<void> {
     attempts: cfg.attempts,
     backoffMs: cfg.backoffMs,
     timeoutMs: cfg.timeoutMs,
+    minIntervalMs: cfg.requestIntervalMs,
+    rateLimitCooldownMs: cfg.rateLimitCooldownMs,
   });
 
   // Ephemeral dedupe store (no-op writer, throwaway path): never touches real data.

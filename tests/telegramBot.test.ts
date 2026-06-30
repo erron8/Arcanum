@@ -219,14 +219,20 @@ describe('TelegramTransport delivery (confirmed)', () => {
     bot.setGmgnEnricher(async () => ({
       symbol: 'WIF',
       platform: 'Pump',
+      priceUsd: 0.00042,
+      athUsd: 0.00113,
       fdvUsd: 980_000,
+      fdvAthUsd: 2_650_000,
       liquidityUsd: 120_000,
       holderCount: 4321,
     }));
     await bot.buildSink()([payload('m1')]);
     const msg = sent.map((s) => s.text).join('\n');
     expect(msg).toContain('ATH Drawdown Alert'); // watch framing preserved
-    expect(msg).toContain('FDV'); // enriched field present
+    expect(msg).toContain('Marketcap'); // enriched field present
+    expect(msg).toContain('ATH Marketcap');
+    expect(msg).toContain('USD:');
+    expect(msg).not.toContain('SOL: ');
     expect(msg).toContain('Holders: 4321');
   });
 
@@ -244,7 +250,7 @@ describe('TelegramTransport delivery (confirmed)', () => {
 
   test('slow enrichment does not delay the alert (bounded by enrichTimeoutMs)', async () => {
     // Tiny 20ms timeout; enricher/linker that never resolve. The alert must still
-    // send promptly as the basic view (no enriched FDV / Meteora line).
+    // send promptly as the basic view (no enriched market-cap / Meteora line).
     const { bot } = await makeTransport({ allowedChatIds: [1] }, [1], emptyFetcher, undefined, 20);
     await bot.init();
     const sent = recorder(bot);
@@ -257,7 +263,7 @@ describe('TelegramTransport delivery (confirmed)', () => {
     expect(elapsed).toBeLessThan(1000); // not blocked on the hung promises
     const msg = sent.map((s) => s.text).join('\n');
     expect(msg).toContain('ATH Drawdown Alert');
-    expect(msg).not.toContain('FDV'); // enrichment timed out → basic view
+    expect(msg).not.toContain('Marketcap'); // enrichment timed out → basic view
     expect(msg).not.toContain('Meteora'); // linker timed out → no pool line
   });
 
@@ -494,7 +500,7 @@ describe('TelegramTransport commands (real handler path)', () => {
     expect(sent.map((m) => m.text).join('\n')).toContain(SOL_MINT_FOR_TEST);
   });
 
-  test('/check renders the full token card in USD with volume + age', async () => {
+  test('/check renders the full token card with market cap, volume, and age', async () => {
     const { bot } = await makeTransport({ allowedChatIds: [7] }, [], fetcherWith(50, 100));
     bot.setGmgnEnricher(async () => ({
       symbol: 'WIF',
@@ -514,12 +520,34 @@ describe('TelegramTransport commands (real handler path)', () => {
     await waitUntil(() => sent.some((m) => m.text.includes('Token Check')));
     const all = sent.map((m) => m.text).join('\n');
     expect(all).toContain(MINT); // contract line
-    expect(all).toContain('USD:'); // price shown in USD (not SOL), from GMGN
-    expect(all).toContain('FDV'); // enriched market cap
+    expect(all).toContain('Marketcap'); // enriched market cap
+    expect(all).toContain('ATH Marketcap');
     expect(all).toContain('Vol:'); // 24h volume present
     expect(all).toContain('Age:'); // token age present
     expect(all).toContain('WIF/SOL 80/0\\.8%'); // Meteora pool link
+    expect(all).not.toContain('USD:'); // /check is market-cap-first when mcap exists
     expect(all).not.toContain('SOL: '); // price must not be denominated in SOL
+  });
+
+  test('/check falls back to Jupiter symbol and does not show native SOL price', async () => {
+    const { bot } = await makeTransport(
+      { allowedChatIds: [7], quote: 'native' },
+      [],
+      fetcherWith(0.001, 0.002),
+      'CAT',
+    );
+    bot.setMeteoraLinker(async () => [
+      { poolAddress: 'P1', quoteSymbol: 'SOL', binStep: 80, baseFeePct: 0.8, url: 'https://app.meteora.ag/dlmm/P1' },
+    ]);
+    const sent = recorder(bot);
+    await bot.handleUpdate(cmdUpdate(7, `/check ${MINT}`));
+    await waitUntil(() => sent.some((m) => m.text.includes('Token Check')));
+    const all = sent.map((m) => m.text).join('\n');
+    expect(all).toContain('$CAT');
+    expect(all).toContain('CAT/SOL 80/0\\.8%');
+    expect(all).toContain('⬇️*50\\.00%*');
+    expect(all).not.toContain('SOL: ');
+    expect(all).not.toContain('ATH: *0\\.002');
   });
 
   test('/check rejects an invalid mint', async () => {

@@ -32,11 +32,10 @@ Works in DMs and **group chats** (replies tag whoever ran the command).
 ```
 🔍 drooling cat  [$1.38M]  [⬇️50.31%]  $DROOLING
 
-🏔 ATH: $2.76M
+🏔 ATH Marketcap: $2.76M
 
 🌐 Solana @ Pump.fun
-💰 USD: 0.00137138
-💎 FDV: $1.38M ⇨ $2.76M
+💎 Marketcap: $1.38M ⇨ $2.76M
 💦 Liq: $102.2K  [x13.4]
 📊 Vol: $1.38M  ·  Age: 15.0d
 

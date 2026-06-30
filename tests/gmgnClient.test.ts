@@ -11,6 +11,13 @@ function jsonRes(body: unknown, status = 200): GmgnFetchResponse {
   };
 }
 
+function jsonResWithRetryAfter(body: unknown, status: number, retryAfter: string): GmgnFetchResponse {
+  return {
+    ...jsonRes(body, status),
+    headers: { get: (name: string) => (name.toLowerCase() === 'retry-after' ? retryAfter : null) },
+  };
+}
+
 const deps = (fetchImpl: GmgnFetch) => ({
   fetch: fetchImpl,
   uuid: () => 'fixed-uuid-1234',
@@ -115,6 +122,59 @@ describe('GmgnClient retries', () => {
     const holders = await client.getTopHolders('sol', 'MINT');
     expect(calls).toBe(2);
     expect(holders.length).toBe(1);
+  });
+
+  test('paces sequential requests through the client-wide throttle', async () => {
+    let now = 1_700_000_000_000;
+    const waits: number[] = [];
+    const client = new GmgnClient(
+      { baseUrl: 'https://x', apiKey: 'k', minIntervalMs: 100, attempts: 1 },
+      {
+        fetch: async () => jsonRes({ data: { symbol: 'WIF' } }),
+        uuid: () => 'u',
+        now: () => now,
+        sleep: async (ms) => {
+          waits.push(ms);
+          now += ms;
+        },
+      },
+    );
+    await client.getTokenInfo('sol', 'MINT1');
+    await client.getTokenInfo('sol', 'MINT2');
+    expect(waits).toContain(100);
+  });
+
+  test('honors Retry-After after a 429 before retrying', async () => {
+    let calls = 0;
+    let now = 1_700_000_000_000;
+    const waits: number[] = [];
+    const client = new GmgnClient(
+      {
+        baseUrl: 'https://x',
+        apiKey: 'k',
+        attempts: 2,
+        backoffMs: 0,
+        minIntervalMs: 0,
+        rateLimitCooldownMs: 5_000,
+      },
+      {
+        fetch: async () => {
+          calls++;
+          return calls === 1
+            ? jsonResWithRetryAfter({}, 429, '2')
+            : jsonRes({ data: { symbol: 'WIF' } });
+        },
+        uuid: () => 'u',
+        now: () => now,
+        sleep: async (ms) => {
+          waits.push(ms);
+          now += ms;
+        },
+      },
+    );
+    const info = await client.getTokenInfo('sol', 'MINT');
+    expect(info?.symbol).toBe('WIF');
+    expect(waits).toContain(2_000);
   });
 });
 
