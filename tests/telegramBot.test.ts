@@ -127,8 +127,8 @@ async function waitUntil(pred: () => boolean, timeoutMs = 2000): Promise<void> {
 }
 
 const MINT = 'So11111111111111111111111111111111111111112';
-/** /testalert renders for wrapped SOL. */
-const SOL_MINT_FOR_TEST = 'So11111111111111111111111111111111111111112';
+/** /testalert renders for the $ANSEM sample token. */
+const EXAMPLE_MINT_FOR_TEST = '9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump';
 
 describe('TelegramTransport subscriber authorization', () => {
   test('prunes unauthorized subscribers on init when allowlist is set', async () => {
@@ -477,7 +477,7 @@ describe('TelegramTransport commands (real handler path)', () => {
     expect(text).toContain('rank 429');
   });
 
-  test('/testalert previews both alert styles with live Meteora links', async () => {
+  test('/testalert previews all three alert styles with live Meteora links', async () => {
     const { bot } = await makeTransport({ allowedChatIds: [7] }, []);
     bot.setMeteoraLinker(async () => [
       { poolAddress: 'P1', quoteSymbol: 'USDC', url: 'https://app.meteora.ag/dlmm/P1' },
@@ -488,8 +488,9 @@ describe('TelegramTransport commands (real handler path)', () => {
     const all = sent.map((m) => m.text).join('\n');
     expect(all).toContain('ATH Drawdown Alert'); // watch-style example
     expect(all).toContain('GMGN Screening Alert'); // gmgn-style example
-    expect(all).toContain('SOL/USDC'); // live Meteora pool link
-    expect(all).toContain('Wrapped SOL'); // curated sample
+    expect(all).toContain('Zap In Reminder'); // zap-style example
+    expect(all).toContain('ANSEM/USDC'); // live Meteora pool link
+    expect(all).toContain('Ansem'); // curated sample
   });
 
   test('/testalert still renders when no Meteora linker is wired', async () => {
@@ -497,7 +498,7 @@ describe('TelegramTransport commands (real handler path)', () => {
     const sent = recorder(bot);
     await bot.handleUpdate(cmdUpdate(7, '/testalert'));
     await waitUntil(() => sent.some((m) => m.text.includes('Example alerts')));
-    expect(sent.map((m) => m.text).join('\n')).toContain(SOL_MINT_FOR_TEST);
+    expect(sent.map((m) => m.text).join('\n')).toContain(EXAMPLE_MINT_FOR_TEST);
   });
 
   test('/check renders the full token card with market cap, volume, and age', async () => {

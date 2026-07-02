@@ -1,5 +1,4 @@
 import type { GmgnConfig } from '../alerts/config';
-import type { AlertStore } from '../alerts/store';
 import { GmgnClient, toNum } from './client';
 import { GmgnScreenedStore } from './store';
 import { formatRichMessages } from '../alerts/richFormat';
@@ -599,8 +598,6 @@ export interface ScannerDeps {
   client: GmgnClient;
   store: GmgnScreenedStore;
   notify: GmgnNotifier;
-  /** Optional watch store for GMGN_AUTO_WATCH. */
-  watchStore?: AlertStore;
   /** Optional Meteora DLMM linker; adds pool links to deliverable alerts. */
   meteora?: MeteoraLinker;
   now?: () => number;
@@ -782,9 +779,6 @@ export class GmgnScanner {
                 `it may re-alert after a restart:`,
               err,
             );
-          }
-          if (this.cfg.autoWatch && this.deps.watchStore) {
-            this.deps.watchStore.upsertWatch(c.mint, 50, { symbol: c.symbol });
           }
         }
         const last = fresh[fresh.length - 1]!;

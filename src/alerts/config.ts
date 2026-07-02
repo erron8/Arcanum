@@ -68,11 +68,12 @@ export const GMGN_KEY_PLACEHOLDERS = new Set([
 ]);
 
 /**
- * Configuration for the GMGN drawdown scanner. The scanner is a core feature — it runs
- * automatically and a valid GMGN_API_KEY is always required (validated at startup).
+ * Configuration for the optional GMGN drawdown scanner. Manual `/watch` alerts do not
+ * depend on it; a GMGN key is only required for GMGN enrichment and scanner use.
  */
 export interface GmgnConfig {
-  apiKey: string; // always required (validated, non-placeholder)
+  enabled: boolean;
+  apiKey: string;
   baseUrl: string;
   scanIntervalMs: number;
   totalFeeMinSol: number;
@@ -83,6 +84,7 @@ export interface GmgnConfig {
   scanLimit: number;
   scanConcurrency: number;
   dedupeMs: number;
+  /** Legacy compatibility only; scanner candidates are never added to `/watch`. */
   autoWatch: boolean;
   screenedPath: string;
   // request resilience (shared defaults with the Jupiter fetch tunables)
@@ -91,6 +93,30 @@ export interface GmgnConfig {
   timeoutMs: number;
   requestIntervalMs: number;
   rateLimitCooldownMs: number;
+}
+
+/**
+ * Configuration for the optional "Zap In" reminder scanner. Like the GMGN drawdown
+ * scanner it is opt-in and shares the same GMGN client/key; it looks for the inverse
+ * setup — tokens at a *fresh* ATH with bullish momentum — and pushes separate
+ * `Zap In Reminder` alerts. Its candidates are never added to `/watch`.
+ */
+export interface ZapConfig {
+  enabled: boolean;
+  scanIntervalMs: number;
+  marketCapMinUsd: number;
+  maxTokenAgeHours: number;
+  /** Max % below ATH the current price (and recent high) may sit and still count as "at a new ATH". */
+  athTolerancePct: number;
+  /** Min USD volume in the single hottest recent 5-minute candle. */
+  volumeMin5mUsd: number;
+  /** Supertrend ATR period and multiplier, computed on 15m candles. */
+  supertrendPeriod: number;
+  supertrendMultiplier: number;
+  scanLimit: number;
+  scanConcurrency: number;
+  dedupeMs: number;
+  screenedPath: string;
 }
 
 export interface AppConfig {
@@ -117,6 +143,7 @@ export interface AppConfig {
   webhookPort: number;
   webhookSecret: string | undefined;
   gmgn: GmgnConfig;
+  zap: ZapConfig;
   meteora: MeteoraConfig;
 }
 
@@ -135,6 +162,7 @@ function buildMeteoraConfig(env: Env): MeteoraConfig {
 /** Build the GMGN sub-config from the environment (pure; defaults for blanks). */
 function buildGmgnConfig(env: Env): GmgnConfig {
   return {
+    enabled: rawBool(env, 'GMGN_SCANNER_ENABLED', false),
     apiKey: rawStr(env, 'GMGN_API_KEY', '').trim(),
     baseUrl: rawStr(env, 'GMGN_BASE_URL', GMGN_DEFAULT_BASE_URL).replace(/\/+$/, ''),
     scanIntervalMs: rawNum(env, 'GMGN_SCAN_INTERVAL_MS', 300_000),
@@ -146,7 +174,7 @@ function buildGmgnConfig(env: Env): GmgnConfig {
     scanLimit: rawNum(env, 'GMGN_SCAN_LIMIT', 100),
     scanConcurrency: rawNum(env, 'GMGN_SCAN_CONCURRENCY', 4),
     dedupeMs: rawNum(env, 'GMGN_DEDUPE_MS', 86_400_000),
-    autoWatch: rawBool(env, 'GMGN_AUTO_WATCH', false),
+    autoWatch: false,
     screenedPath: rawStr(env, 'GMGN_SCREENED_PATH', './data/gmgn-screened.json'),
     // Reuse the Jupiter fetch tunables as sensible defaults for the GMGN client.
     attempts: rawNum(env, 'FETCH_ATTEMPTS', 3),
@@ -154,6 +182,24 @@ function buildGmgnConfig(env: Env): GmgnConfig {
     timeoutMs: rawNum(env, 'FETCH_TIMEOUT_MS', 8_000),
     requestIntervalMs: rawNum(env, 'GMGN_REQUEST_INTERVAL_MS', 1_000),
     rateLimitCooldownMs: rawNum(env, 'GMGN_429_COOLDOWN_MS', 20_000),
+  };
+}
+
+/** Build the Zap In scanner sub-config from the environment (pure; defaults for blanks). */
+function buildZapConfig(env: Env): ZapConfig {
+  return {
+    enabled: rawBool(env, 'ZAP_SCANNER_ENABLED', false),
+    scanIntervalMs: rawNum(env, 'ZAP_SCAN_INTERVAL_MS', 300_000),
+    marketCapMinUsd: rawNum(env, 'ZAP_MARKET_CAP_MIN_USD', 250_000),
+    maxTokenAgeHours: rawNum(env, 'ZAP_MAX_TOKEN_AGE_HOURS', 48),
+    athTolerancePct: rawNum(env, 'ZAP_ATH_TOLERANCE_PCT', 3),
+    volumeMin5mUsd: rawNum(env, 'ZAP_VOLUME_MIN_5M_USD', 25_000),
+    supertrendPeriod: rawNum(env, 'ZAP_SUPERTREND_PERIOD', 10),
+    supertrendMultiplier: rawNum(env, 'ZAP_SUPERTREND_MULTIPLIER', 3),
+    scanLimit: rawNum(env, 'ZAP_SCAN_LIMIT', 100),
+    scanConcurrency: rawNum(env, 'ZAP_SCAN_CONCURRENCY', 4),
+    dedupeMs: rawNum(env, 'ZAP_DEDUPE_MS', 86_400_000),
+    screenedPath: rawStr(env, 'ZAP_SCREENED_PATH', './data/zap-screened.json'),
   };
 }
 
@@ -194,6 +240,7 @@ export function buildConfig(env: Env): AppConfig {
     webhookPort: rawNum(env, 'WEBHOOK_PORT', 8080),
     webhookSecret: env.WEBHOOK_SECRET_TOKEN?.trim() || undefined,
     gmgn: buildGmgnConfig(env),
+    zap: buildZapConfig(env),
     meteora: buildMeteoraConfig(env),
   };
 }
@@ -349,6 +396,7 @@ export function validateEnv(env: Env): string[] {
   }
 
   validateGmgnEnv(env, errors, { requirePositive, requireRange, requireInt });
+  validateZapEnv(env, errors, { requirePositive, requireRange, requireInt });
 
   // Meteora pool links: bound the per-alert link count.
   const maxPools = requireInt('METEORA_MAX_POOLS', 5, 1);
@@ -360,9 +408,9 @@ export function validateEnv(env: Env): string[] {
 }
 
 /**
- * Validate the GMGN scanner configuration. The drawdown scanner is a core, always-on
- * feature, so a valid GMGN_API_KEY is always required — empty or the .env.example
- * placeholder both fail startup. Numeric tunables are range-checked.
+ * Validate the GMGN scanner configuration. The scanner is opt-in: a valid
+ * GMGN_API_KEY is required only when automatic scanning is enabled, or when a real
+ * key is present and the scanner can be used on demand.
  */
 function validateGmgnEnv(
   env: Env,
@@ -374,13 +422,22 @@ function validateGmgnEnv(
   },
 ): void {
   const key = env.GMGN_API_KEY;
-  if (key === undefined || key.trim() === '') {
-    errors.push('GMGN_API_KEY is required (the drawdown scanner needs it to reach GMGN).');
-  } else if (GMGN_KEY_PLACEHOLDERS.has(key.trim())) {
-    errors.push(
-      'GMGN_API_KEY is still the .env.example placeholder — set your real GMGN OpenAPI key.',
-    );
+  const scannerEnabled = rawBool(env, 'GMGN_SCANNER_ENABLED', false);
+  const hasKey = key !== undefined && key.trim() !== '';
+  const hasPlaceholderKey = hasKey && GMGN_KEY_PLACEHOLDERS.has(key.trim());
+  const hasRealKey = hasKey && !hasPlaceholderKey;
+
+  if (scannerEnabled) {
+    if (!hasKey) {
+      errors.push('GMGN_API_KEY is required when GMGN_SCANNER_ENABLED=true.');
+    } else if (hasPlaceholderKey) {
+      errors.push(
+        'GMGN_API_KEY is still the .env.example placeholder — set your real GMGN OpenAPI key.',
+      );
+    }
   }
+
+  if (!scannerEnabled && !hasRealKey) return;
 
   // Scan interval must never tick faster than once a minute.
   v.requirePositive('GMGN_SCAN_INTERVAL_MS', 300_000, 60_000);
@@ -419,6 +476,61 @@ function validateGmgnEnv(
     errors.push(
       `GMGN_MIN_TOKEN_AGE_HOURS (${minHours}h) must be less than ` +
         `GMGN_MAX_TOKEN_AGE_DAYS (${maxDays}d).`,
+    );
+  }
+}
+
+/**
+ * Validate the Zap In scanner configuration. Opt-in and key-gated exactly like the
+ * GMGN scanner: it shares the GMGN client, so a real GMGN_API_KEY is required to run
+ * it (and mandatory when ZAP_SCANNER_ENABLED=true). Its tunables are only checked
+ * once the scanner is reachable (enabled, or a real key is present for on-demand /zap).
+ */
+function validateZapEnv(
+  env: Env,
+  errors: string[],
+  v: {
+    requirePositive: (name: string, def: number, min: number) => number;
+    requireRange: (name: string, def: number, lo: number, hi: number) => number;
+    requireInt: (name: string, def: number, min: number) => number;
+  },
+): void {
+  const key = env.GMGN_API_KEY;
+  const scannerEnabled = rawBool(env, 'ZAP_SCANNER_ENABLED', false);
+  const hasKey = key !== undefined && key.trim() !== '';
+  const hasPlaceholderKey = hasKey && GMGN_KEY_PLACEHOLDERS.has(key.trim());
+  const hasRealKey = hasKey && !hasPlaceholderKey;
+
+  if (scannerEnabled) {
+    if (!hasKey) {
+      errors.push('GMGN_API_KEY is required when ZAP_SCANNER_ENABLED=true.');
+    } else if (hasPlaceholderKey) {
+      errors.push(
+        'GMGN_API_KEY is still the .env.example placeholder — set your real GMGN OpenAPI key.',
+      );
+    }
+  }
+
+  if (!scannerEnabled && !hasRealKey) return;
+
+  v.requirePositive('ZAP_SCAN_INTERVAL_MS', 300_000, 60_000);
+  v.requirePositive('ZAP_MARKET_CAP_MIN_USD', 250_000, 0);
+  v.requireRange('ZAP_MAX_TOKEN_AGE_HOURS', 48, 0, 24 * 365);
+  v.requireRange('ZAP_ATH_TOLERANCE_PCT', 3, 0, 100);
+  v.requirePositive('ZAP_VOLUME_MIN_5M_USD', 25_000, 0);
+  v.requireInt('ZAP_SUPERTREND_PERIOD', 10, 1);
+  v.requireRange('ZAP_SUPERTREND_MULTIPLIER', 3, 0, 100);
+  v.requireInt('ZAP_DEDUPE_MS', 86_400_000, 0);
+
+  const limit = v.requireInt('ZAP_SCAN_LIMIT', 100, 1);
+  if (Number.isFinite(limit) && limit > 100) {
+    errors.push(`ZAP_SCAN_LIMIT must be in [1, 100] (got '${env.ZAP_SCAN_LIMIT}').`);
+  }
+
+  const concurrency = v.requireInt('ZAP_SCAN_CONCURRENCY', 4, 1);
+  if (Number.isFinite(concurrency) && concurrency > GMGN_MAX_CONCURRENCY) {
+    errors.push(
+      `ZAP_SCAN_CONCURRENCY must be in [1, ${GMGN_MAX_CONCURRENCY}] (got '${env.ZAP_SCAN_CONCURRENCY}').`,
     );
   }
 }

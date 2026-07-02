@@ -640,7 +640,7 @@ describe('GmgnScanner.scanOnce', () => {
     expect(store.wasRecentlyAlerted('MINT1', gcfg().dedupeMs)).toBe(false);
   });
 
-  test('GMGN_AUTO_WATCH adds the passing mint to the AlertStore at threshold 50', async () => {
+  test('scanner does not add passing mints to the manual AlertStore', async () => {
     const store = await newScreenedStore();
     const watch = new AlertStore(
       join(tmpdir(), `aw-${Date.now()}.json`),
@@ -651,12 +651,10 @@ describe('GmgnScanner.scanOnce', () => {
       client: makeClient(passingRoutes()),
       store,
       notify: async () => true,
-      watchStore: watch,
       now: () => NOW,
     });
     await scanner.scanOnce();
-    expect(watch.has('MINT1')).toBe(true);
-    expect(watch.get('MINT1')!.threshold).toBe(50);
+    expect(watch.has('MINT1')).toBe(false);
   });
 
   test('a single token failure does not abort the cycle', async () => {

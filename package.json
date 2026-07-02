@@ -3,12 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Arcanum — a Telegram bot that automatically and manually tracks ATH drawdown on trending Solana memecoins (GMGN, Jupiter, Meteora; grammY)",
+  "description": "Arcanum — a Telegram bot for manual ATH drawdown watches on Solana tokens, with optional GMGN screening",
   "scripts": {
     "start": "bun run src/alerts/index.ts",
     "typecheck": "tsc --noEmit",
     "selfcheck": "bun run src/utils/selfcheck.ts",
     "gmgn:dryrun": "bun run src/gmgn/dryrun.ts",
+    "zap:dryrun": "bun run src/gmgn/zapDryrun.ts",
     "test": "bun test"
   },
   "dependencies": {

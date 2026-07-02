@@ -13,17 +13,24 @@ import { escMarkdownV2 as esc, fmtPrice, fmtPct } from './format';
 import { formatRichMessages } from './richFormat';
 import type { RichTokenView } from './richFormat';
 import type { CycleSummary, GmgnScanStatus } from '../gmgn/scanner';
+import type { ZapCycleSummary, ZapScanStatus } from '../gmgn/zapScanner';
 import type { GmgnEnricher } from '../gmgn/enrich';
 import type { MeteoraLinker, MeteoraPoolLink } from '../meteora/client';
 
-/** Wrapped-SOL mint, used by /testalert as a known token with live pools. */
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
+/** Sample token ($ANSEM) used by /testalert to preview the alert layouts. */
+const EXAMPLE_MINT = '9cRCn9rGT8V2imeM2BaKs13yhMEais3ruM3rPvTGpump';
 
 /** Runs one GMGN scan cycle on demand; null means a cycle was already running. */
 export type GmgnScanTrigger = () => Promise<CycleSummary | null>;
 
 /** Returns a snapshot of recent GMGN scanner activity for /gmgnstatus. */
 export type GmgnStatusProvider = () => GmgnScanStatus;
+
+/** Runs one Zap In scan cycle on demand; null means a cycle was already running. */
+export type ZapScanTrigger = () => Promise<ZapCycleSummary | null>;
+
+/** Returns a snapshot of recent Zap scanner activity for /zapstatus. */
+export type ZapStatusProvider = () => ZapScanStatus;
 
 /**
  * Default cap on how long an alert waits for GMGN + Meteora enrichment before
@@ -94,6 +101,10 @@ export class TelegramTransport {
   private meteoraLink: MeteoraLinker | null = null;
   /** Optional GMGN scanner status provider; enables /gmgnstatus. */
   private gmgnStatus: GmgnStatusProvider | null = null;
+  /** Optional manual Zap In scan trigger; set only when the zap scanner is enabled. */
+  private zapScan: ZapScanTrigger | null = null;
+  /** Optional Zap scanner status provider; enables /zapstatus. */
+  private zapStatus: ZapStatusProvider | null = null;
   private readonly enrichTimeoutMs: number;
 
   constructor(
@@ -179,6 +190,20 @@ export class TelegramTransport {
   /** Wire a GMGN scanner status provider, enabling the /gmgnstatus command. */
   setGmgnStatus(provider: GmgnStatusProvider): void {
     this.gmgnStatus = provider;
+  }
+
+  /**
+   * Enable the `/zap` command by wiring a manual Zap In scan trigger. Set by the
+   * composition root only when the zap scanner is available; otherwise `/zap` replies
+   * that the scanner is off.
+   */
+  setZapScan(trigger: ZapScanTrigger): void {
+    this.zapScan = trigger;
+  }
+
+  /** Wire a Zap scanner status provider, enabling the /zapstatus command. */
+  setZapStatus(provider: ZapStatusProvider): void {
+    this.zapStatus = provider;
   }
 
   /**
@@ -411,60 +436,86 @@ export class TelegramTransport {
   }
 
   /**
-   * Render example alerts (watch + GMGN style) so a user can preview the alert layout
-   * on demand via /testalert. Uses curated, internally-consistent sample stats (the
-   * live GMGN record for the SOL mint is not representative of a memecoin alert), but
-   * keeps the **live Meteora DLMM pool links** for the SOL mint (SOL/USDC etc.).
+   * Render one example of EACH alert type so a user can preview the layouts on demand
+   * via /testalert: an ATH Drawdown Alert (/watch), a GMGN Screening Alert, and a Zap In
+   * Reminder. Uses curated, internally-consistent sample stats for $ANSEM — the drawdown
+   * cards show it down from ATH, and the zap card shows it at a fresh ATH — but keeps the
+   * **live Meteora DLMM pool links** for the sample mint when a linker is wired.
    */
   async processExample(chatId: number, replyTo?: number): Promise<void> {
     let pools: MeteoraPoolLink[] = [];
     if (this.meteoraLink) {
       try {
-        pools = await this.meteoraLink(SOL_MINT);
+        pools = await this.meteoraLink(EXAMPLE_MINT);
       } catch (err) {
         console.error('[telegram] Meteora links (example) failed:', err);
       }
     }
 
-    // Curated sample so the preview is always clean and complete.
-    const sample: Partial<RichTokenView> = {
-      mint: SOL_MINT,
-      symbol: 'SOL',
-      name: 'Wrapped SOL',
+    // Curated sample stats shared across all three preview cards.
+    const base: Partial<RichTokenView> = {
+      mint: EXAMPLE_MINT,
+      symbol: 'ANSEM',
+      name: 'Ansem',
       chain: 'Solana',
-      platform: 'Raydium',
-      priceUsd: 152.34,
-      fdvUsd: 72_000_000_000,
-      fdvAthUsd: 122_900_000_000,
-      liquidityUsd: 8_500_000,
-      volumeUsd: 1_900_000_000,
-      vol1hUsd: 95_000_000,
-      change1hPct: -1.2,
-      athUsd: 259.96,
-      drawdownPct: 41.4,
-      holderCount: 1_200_000,
-      top10Pct: 18,
-      smartMoney: { smHolding: 6, kolHolding: 3, smExited: 2, smUnrealizedPositive: 4 },
-      socials: { website: 'https://solana.com', twitter: 'https://x.com/solana' },
+      platform: 'Pump',
+      liquidityUsd: 240_000,
+      holderCount: 18_400,
+      top10Pct: 22,
+      smartMoney: { smHolding: 5, kolHolding: 2, smExited: 3, smUnrealizedPositive: 2 },
+      socials: { twitter: 'https://x.com/blknoiz06' },
       meteoraPools: pools.length > 0 ? pools : undefined,
+      quote: 'usd',
     };
-    const watchView: RichTokenView = { ...sample, mint: SOL_MINT, kind: 'watch', threshold: 40, quote: 'usd' };
+
+    // Drawdown scenario (~71% below ATH) — the /watch and GMGN cards.
+    const drawdown: Partial<RichTokenView> = {
+      ...base,
+      priceUsd: 0.0032,
+      fdvUsd: 3_200_000,
+      fdvAthUsd: 11_000_000,
+      athUsd: 0.011,
+      volumeUsd: 5_400_000,
+      drawdownPct: 70.9,
+    };
+    const watchView: RichTokenView = { ...drawdown, mint: EXAMPLE_MINT, kind: 'watch', threshold: 50 };
     const gmgnView: RichTokenView = {
-      ...sample,
-      mint: SOL_MINT,
+      ...drawdown,
+      mint: EXAMPLE_MINT,
       kind: 'gmgn',
       verdict: 'PASS',
       warnings: [],
       hardFails: [],
-      quote: 'usd',
+    };
+
+    // Fresh-ATH scenario — the Zap In Reminder card (at the peak, no drawdown).
+    const zapView: RichTokenView = {
+      ...base,
+      mint: EXAMPLE_MINT,
+      kind: 'zap',
+      priceUsd: 0.011,
+      fdvUsd: 11_000_000,
+      fdvAthUsd: 11_000_000,
+      ageHours: 20.5,
+      volumeUsd: 1_250_000,
+      signals: [
+        'Fresh ATH · mcap $11.0M',
+        '5m volume $42.0K ≥ $25.0K',
+        '15m Supertrend bullish (10/3)',
+        'Age 20.5h (< 2.0d)',
+      ],
     };
 
     await this.sendDirect(
       chatId,
-      '🧪 *Example alerts* — sample render \\(SOL\\)\\. Preview only, not a real trigger\\.',
+      '🧪 *Example alerts* — sample render \\(ANSEM\\)\\. Preview only, not a real trigger\\.',
       replyTo,
     );
-    const messages = [...formatRichMessages([watchView]), ...formatRichMessages([gmgnView])];
+    const messages = [
+      ...formatRichMessages([watchView]),
+      ...formatRichMessages([gmgnView]),
+      ...formatRichMessages([zapView]),
+    ];
     for (const m of messages) await this.sendDirect(chatId, m, replyTo);
   }
 
@@ -606,7 +657,9 @@ export class TelegramTransport {
       { command: 'resetath', description: 'Reset stored ATH and re-arm: /resetath <mint>' },
       { command: 'scan', description: 'Run a GMGN drawdown scan now' },
       { command: 'gmgnstatus', description: 'Show the last GMGN scan summary' },
-      { command: 'testalert', description: 'Preview an example alert' },
+      { command: 'zap', description: 'Scan now for Zap In (fresh-ATH breakout) reminders' },
+      { command: 'zapstatus', description: 'Show the last Zap In scan summary' },
+      { command: 'testalert', description: 'Preview example alerts (drawdown, GMGN, zap)' },
       { command: 'stop', description: 'Unsubscribe this chat from alerts' },
       { command: 'help', description: 'Show all commands' },
     ];
@@ -623,16 +676,16 @@ export class TelegramTransport {
         [
           '📜 *Arcanum*',
           '',
-          'I track drawdown from all\\-time highs on Solana memecoins — automatically and on demand\\.',
+          'I track drawdown from all\\-time highs for the Solana tokens you choose\\.',
           '',
-          '🔎 *Automatic* — I scan trending memecoins and alert you when one is deep in drawdown but still alive\\. Force a scan with /scan\\.',
-          '',
-          '🚀 *Manual*',
+          '🚀 *Manual tracking*',
           '   🔍  /check `<mint>` — full card for any token, now',
           '   📈  /watch `<mint>` — track one and alert on drawdown',
           '   📋  /list — your watchlist · ❓ /help — all commands',
           '',
-          '🔔 You are now subscribed — scanner alerts will arrive here\\.',
+          '🔎 Optional: /scan runs one GMGN screen when configured\\.',
+          '',
+          '🔔 You are now subscribed — watched\\-token alerts will arrive here\\.',
         ].join('\n'),
       );
     });
@@ -817,6 +870,26 @@ export class TelegramTransport {
       await this.replyTo(ctx, this.gmgnStatusText());
     });
 
+    bot.command('zap', async (ctx) => {
+      this.remember(ctx.chat?.id);
+      if (!this.zapScan) {
+        await this.replyTo(
+          ctx,
+          ['🛑 *Zap scanner unavailable*', '', 'The Zap In scanner is not wired up on this instance\\.'].join('\n'),
+        );
+        return;
+      }
+      // Ack immediately; a cycle can take several seconds (rank + per-token klines).
+      await this.replyTo(ctx, '⚡ Scanning for Zap In setups…');
+      const chatId = ctx.chat?.id;
+      if (chatId !== undefined) void this.processZap(chatId, ctx.msgId);
+    });
+
+    bot.command('zapstatus', async (ctx) => {
+      this.remember(ctx.chat?.id);
+      await this.replyTo(ctx, this.zapStatusText());
+    });
+
     bot.command('testalert', async (ctx) => {
       this.remember(ctx.chat?.id);
       // Ack immediately; enrichment (GMGN + Meteora) can take a moment.
@@ -899,6 +972,80 @@ export class TelegramTransport {
       lines.push(`🪧 Base\\-drops: ${esc(summary.baseDropSummary)}`);
     }
     await this.sendDirect(chatId, lines.join('\n'), replyTo);
+  }
+
+  /** Async body of /zap: run one Zap In cycle, then follow up with the counts. */
+  async processZap(chatId: number, replyTo?: number): Promise<void> {
+    if (!this.zapScan) return;
+    let summary: ZapCycleSummary | null;
+    try {
+      summary = await this.zapScan();
+    } catch (err) {
+      console.error('[telegram] /zap failed:', err);
+      await this.sendDirect(chatId, '❌ Zap scan failed; check the logs and try again later\\.', replyTo);
+      return;
+    }
+    if (summary === null) {
+      await this.sendDirect(
+        chatId,
+        '⏳ A zap scan is already running — its results will arrive shortly\\.',
+        replyTo,
+      );
+      return;
+    }
+    const lines = [
+      '⚡ *Zap In scan complete*',
+      '',
+      `📈 Trending: *${summary.trending}*  ·  ⚡ Quick\\-pass: *${summary.quickPass}*`,
+      `🎯 Qualified: *${summary.qualified}*`,
+      '',
+      summary.fresh === 0
+        ? '😴 No new setups \\(already alerted or none matched\\)\\.'
+        : summary.delivered
+          ? `🚀 Sent *${summary.fresh}* new reminder\\(s\\)\\.`
+          : `⚠️ *${summary.fresh}* new setup\\(s\\) found but delivery failed — will retry next cycle\\.`,
+    ];
+    if (summary.dropSummary) {
+      lines.push(`🪧 Drops: ${esc(summary.dropSummary)}`);
+    }
+    await this.sendDirect(chatId, lines.join('\n'), replyTo);
+  }
+
+  /** Build the MarkdownV2 reply for /zapstatus from the zap scanner status provider. */
+  private zapStatusText(): string {
+    if (!this.zapStatus) {
+      return ['🛑 *Zap scanner unavailable*', '', 'The Zap In scanner is not wired up on this instance\\.'].join('\n');
+    }
+    const s = this.zapStatus();
+    const lines: string[] = ['⚡ *Zap In scanner status*', ''];
+    lines.push(s.scanning ? '⚙️ State: _scanning…_' : '💤 State: idle');
+
+    if (s.lastSummary && s.lastSummaryAt !== null) {
+      const m = s.lastSummary;
+      lines.push(`🕒 Last scan: ${esc(ageString(s.lastSummaryAt))}`);
+      lines.push('');
+      lines.push(`📈 Trending: *${m.trending}*  ·  ⚡ Quick\\-pass: *${m.quickPass}*`);
+      lines.push(`🎯 Qualified: *${m.qualified}*  ·  🆕 New: *${m.fresh}*`);
+      lines.push(`📤 Delivered: ${m.delivered ? '✅ yes' : '— no'}`);
+      if (m.dropSummary) {
+        lines.push(`🪧 Drops: ${esc(m.dropSummary)}`);
+      }
+    } else {
+      lines.push('');
+      lines.push('_No scan has completed yet\\._');
+    }
+
+    if (s.lastDelivered) {
+      const d = s.lastDelivered;
+      const label = d.symbol ? `*${esc(d.symbol)}* ` : '';
+      lines.push('');
+      lines.push(`🏷️ Last delivered: ${label}\`${esc(d.mint)}\` \\(${esc(ageString(d.at))}\\)`);
+    }
+    if (s.lastError) {
+      lines.push('');
+      lines.push(`⚠️ Last error: ${esc(s.lastError.message)} \\(${esc(ageString(s.lastError.at))}\\)`);
+    }
+    return lines.join('\n');
   }
 
   /**
@@ -1108,15 +1255,17 @@ const HELP_TEXT = [
   '/check `<mint>` — full token card',
   '/resetath `<mint>` — reset stored ATH',
   '',
-  '🔎 *Scanner*',
-  '/scan — scan trending coins now',
-  '/gmgnstatus — last scan summary',
+  '🔎 *Optional Scanners*',
+  '/scan — run one GMGN drawdown screen now',
+  '/gmgnstatus — last drawdown scan summary',
+  '/zap — scan for Zap In \\(fresh\\-ATH breakout\\) reminders',
+  '/zapstatus — last Zap In scan summary',
   '',
   '🔔 *Subscription*',
   '/start — subscribe to alerts',
   '/stop — unsubscribe',
   '',
   '🧪 *Other*',
-  '/testalert — preview an example alert',
+  '/testalert — preview one of each alert \\(drawdown, GMGN, zap\\)',
   '/help — this message',
 ].join('\n');

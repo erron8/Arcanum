@@ -1,10 +1,11 @@
-import { buildConfig, validateEnv } from './config';
+import { GMGN_KEY_PLACEHOLDERS, buildConfig, validateEnv } from './config';
 import { AlertStore } from './store';
 import { AthMonitor } from './athMonitor';
 import { TelegramTransport } from './telegramBot';
 import { GmgnClient } from '../gmgn/client';
 import { GmgnScreenedStore } from '../gmgn/store';
 import { GmgnScanner } from '../gmgn/scanner';
+import { ZapScanner } from '../gmgn/zapScanner';
 import { makeGmgnEnricher } from '../gmgn/enrich';
 import { MeteoraClient } from '../meteora/client';
 import type { MeteoraLinker } from '../meteora/client';
@@ -52,18 +53,22 @@ async function main(): Promise<void> {
   // Wire monitor → telegram (settable sink resolves the circular dependency).
   monitor.setSink(bot.buildSink());
 
-  // GMGN client — a valid GMGN_API_KEY is required at startup, so this is always built.
-  // It powers both the drawdown scanner and rich-layout enrichment for /watch + /check.
-  const gmgnClient = new GmgnClient({
-    baseUrl: config.gmgn.baseUrl,
-    apiKey: config.gmgn.apiKey,
-    attempts: config.gmgn.attempts,
-    backoffMs: config.gmgn.backoffMs,
-    timeoutMs: config.gmgn.timeoutMs,
-    minIntervalMs: config.gmgn.requestIntervalMs,
-    rateLimitCooldownMs: config.gmgn.rateLimitCooldownMs,
-  });
-  bot.setGmgnEnricher(makeGmgnEnricher(gmgnClient));
+  const hasGmgnKey =
+    config.gmgn.apiKey !== '' && !GMGN_KEY_PLACEHOLDERS.has(config.gmgn.apiKey);
+
+  let gmgnClient: GmgnClient | null = null;
+  if (hasGmgnKey) {
+    gmgnClient = new GmgnClient({
+      baseUrl: config.gmgn.baseUrl,
+      apiKey: config.gmgn.apiKey,
+      attempts: config.gmgn.attempts,
+      backoffMs: config.gmgn.backoffMs,
+      timeoutMs: config.gmgn.timeoutMs,
+      minIntervalMs: config.gmgn.requestIntervalMs,
+      rateLimitCooldownMs: config.gmgn.rateLimitCooldownMs,
+    });
+    bot.setGmgnEnricher(makeGmgnEnricher(gmgnClient));
+  }
 
   // Meteora DLMM pool links (public API, no key) — added to every alert/card.
   let meteoraLinker: MeteoraLinker | undefined;
@@ -79,18 +84,38 @@ async function main(): Promise<void> {
     bot.setMeteoraLinker(meteoraLinker);
   }
 
-  // GMGN drawdown scanner — a core, always-on feature.
-  const screenedStore = new GmgnScreenedStore(config.gmgn.screenedPath);
-  await screenedStore.init();
-  const gmgnScanner = new GmgnScanner(config.gmgn, {
-    client: gmgnClient,
-    store: screenedStore,
-    notify: (messages) => bot.notify(messages),
-    watchStore: config.gmgn.autoWatch ? store : undefined,
-    meteora: meteoraLinker,
-  });
-  bot.setGmgnScan(() => gmgnScanner.scanNow());
-  bot.setGmgnStatus(() => gmgnScanner.status());
+  let gmgnScanner: GmgnScanner | null = null;
+  if (gmgnClient) {
+    const screenedStore = new GmgnScreenedStore(config.gmgn.screenedPath);
+    await screenedStore.init();
+    gmgnScanner = new GmgnScanner(config.gmgn, {
+      client: gmgnClient,
+      store: screenedStore,
+      notify: (messages) => bot.notify(messages),
+      meteora: meteoraLinker,
+    });
+    bot.setGmgnScan(() => gmgnScanner!.scanNow());
+    bot.setGmgnStatus(() => gmgnScanner!.status());
+  } else {
+    console.log('[index] GMGN disabled: no real GMGN_API_KEY set; rich GMGN fields and /scan are unavailable.');
+  }
+
+  // Zap In reminder scanner (fresh-ATH breakouts). Shares the GMGN client/key; its
+  // own dedupe store and separate `Zap In Reminder` alerts keep it isolated from the
+  // manual /watch AlertStore, exactly like the GMGN drawdown scanner.
+  let zapScanner: ZapScanner | null = null;
+  if (gmgnClient) {
+    const zapStore = new GmgnScreenedStore(config.zap.screenedPath);
+    await zapStore.init();
+    zapScanner = new ZapScanner(config.zap, {
+      client: gmgnClient,
+      store: zapStore,
+      notify: (messages) => bot.notify(messages),
+      meteora: meteoraLinker,
+    });
+    bot.setZapScan(() => zapScanner!.scanNow());
+    bot.setZapStatus(() => zapScanner!.status());
+  }
 
   let shuttingDown = false;
   const shutdown = async (signal: string, code = 0): Promise<void> => {
@@ -104,6 +129,11 @@ async function main(): Promise<void> {
       await gmgnScanner?.stop();
     } catch (err) {
       console.error('[index] error stopping GMGN scanner:', err);
+    }
+    try {
+      await zapScanner?.stop();
+    } catch (err) {
+      console.error('[index] error stopping Zap scanner:', err);
     }
     try {
       await bot.stop();
@@ -129,22 +159,42 @@ async function main(): Promise<void> {
   });
   monitor.start();
 
-  // Start the GMGN scanner only after Telegram is live so its alerts have a delivery path.
-  gmgnScanner.start();
-  console.log(
-    `[index] GMGN scanner running · scanInterval=${config.gmgn.scanIntervalMs}ms · ` +
-      `feeMin=${config.gmgn.totalFeeMinSol} SOL · mcapMin=$${config.gmgn.marketCapMinUsd} · ` +
-      `drawdownMin=${config.gmgn.drawdownMinPct}% · autoWatch=${config.gmgn.autoWatch}`,
-  );
-
-  // The scanner needs at least one subscriber to deliver to. Warn loudly if there are
-  // none yet — automatic alerts will be found but have nowhere to go until someone
-  // sends /start (or TELEGRAM_CHAT_ID is set).
-  if (bot.subscriberIds().length === 0) {
-    console.warn(
-      '[index] No subscribers yet — automatic scanner alerts have nowhere to send. ' +
-        'Send /start to the bot (or set TELEGRAM_CHAT_ID) to receive them.',
+  // Start the GMGN timer only when explicitly enabled. Manual /watch alerts are the
+  // default behavior; the scanner is on-demand via /scan unless GMGN_SCANNER_ENABLED=true.
+  if (gmgnScanner && config.gmgn.enabled) {
+    gmgnScanner.start();
+    console.log(
+      `[index] GMGN scanner running · scanInterval=${config.gmgn.scanIntervalMs}ms · ` +
+        `feeMin=${config.gmgn.totalFeeMinSol} SOL · mcapMin=$${config.gmgn.marketCapMinUsd} · ` +
+        `drawdownMin=${config.gmgn.drawdownMinPct}%`,
     );
+
+    if (bot.subscriberIds().length === 0) {
+      console.warn(
+        '[index] No subscribers yet — automatic scanner alerts have nowhere to send. ' +
+          'Send /start to the bot (or set TELEGRAM_CHAT_ID) to receive them.',
+      );
+    }
+  } else if (gmgnScanner) {
+    console.log('[index] GMGN scanner timer disabled; use /scan for an explicit one-off scan.');
+  }
+
+  // Start the Zap In timer only when explicitly enabled; otherwise it is on-demand via /zap.
+  if (zapScanner && config.zap.enabled) {
+    zapScanner.start();
+    console.log(
+      `[index] Zap In scanner running · scanInterval=${config.zap.scanIntervalMs}ms · ` +
+        `mcapMin=$${config.zap.marketCapMinUsd} · vol5mMin=$${config.zap.volumeMin5mUsd} · ` +
+        `maxAge=${config.zap.maxTokenAgeHours}h · supertrend=${config.zap.supertrendPeriod}/${config.zap.supertrendMultiplier}`,
+    );
+    if (bot.subscriberIds().length === 0) {
+      console.warn(
+        '[index] No subscribers yet — automatic Zap In alerts have nowhere to send. ' +
+          'Send /start to the bot (or set TELEGRAM_CHAT_ID) to receive them.',
+      );
+    }
+  } else if (zapScanner) {
+    console.log('[index] Zap In scanner timer disabled; use /zap for an explicit one-off scan.');
   }
 
   console.log(

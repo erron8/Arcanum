@@ -8,7 +8,7 @@ import type { MeteoraPoolLink } from '../meteora/client';
  * renderer works whether we have a full GMGN payload or only a Jupiter price/ATH.
  */
 
-export type RichAlertKind = 'watch' | 'gmgn' | 'check';
+export type RichAlertKind = 'watch' | 'gmgn' | 'check' | 'zap';
 export type RichVerdict = 'PASS' | 'WARN' | 'FAIL';
 
 export interface RichHolder {
@@ -54,6 +54,8 @@ export interface RichTokenView {
   verdict?: RichVerdict; // GMGN verdict
   warnings?: string[];
   hardFails?: string[];
+  /** Zap In reminder: the momentum/entry signals that triggered the alert. */
+  signals?: string[];
 
   socials?: { website?: string; twitter?: string; telegram?: string };
   /** Meteora DLMM pools containing this token (top pools by 24h volume). */
@@ -63,6 +65,14 @@ export interface RichTokenView {
 }
 
 const VERDICT_EMOJI: Record<RichVerdict, string> = { PASS: '✅', WARN: '⚠️', FAIL: '⛔' };
+
+/** Leading emoji for a block, by alert kind (GMGN uses its verdict emoji). */
+function blockEmoji(v: RichTokenView): string {
+  if (v.kind === 'gmgn') return VERDICT_EMOJI[v.verdict ?? 'PASS'];
+  if (v.kind === 'check') return '🔍';
+  if (v.kind === 'zap') return '⚡';
+  return '🔻';
+}
 
 const MAX_NAME_LEN = 32;
 function clamp(s: string, n = MAX_NAME_LEN): string {
@@ -188,7 +198,7 @@ function socialLinks(v: RichTokenView): string[] {
  */
 export function formatRichBlock(v: RichTokenView): string {
   // --- title: emoji · *name* (→GMGN) · [mcap] · [drawdown · verdict/threshold] · $TICKER ---
-  const emoji = v.kind === 'gmgn' ? VERDICT_EMOJI[v.verdict ?? 'PASS'] : v.kind === 'check' ? '🔍' : '🔻';
+  const emoji = blockEmoji(v);
   // The token NAME links to its GMGN page (primary trading terminal).
   const gmgnUrl = `https://gmgn.ai/sol/token/${v.mint}`;
   const symbolLabel = cleanTokenLabel(v.symbol, v.mint);
@@ -222,6 +232,13 @@ export function formatRichBlock(v: RichTokenView): string {
     ath.push(`🏔 ATH Marketcap: *${esc(fdvAth)}*`);
   } else if (v.athUsd !== undefined && v.kind !== 'check') {
     ath.push(`🏔 ATH: *${esc(fmtPrice(v.athUsd))}* ${v.quote === 'native' ? 'SOL' : 'USD'}`);
+  }
+
+  // --- zap in signals (entry criteria that triggered the reminder) ---
+  const signals: string[] = [];
+  if (v.signals && v.signals.length > 0) {
+    signals.push('⚡ *Zap signals*');
+    for (const s of v.signals.slice(0, 6)) signals.push(`✅ ${esc(s)}`);
   }
 
   // --- market stats ---
@@ -306,7 +323,7 @@ export function formatRichBlock(v: RichTokenView): string {
   const contract = [`\`${esc(v.mint)}\``];
 
   // Join sections with a blank line, skipping any empty section.
-  return [title, ath, market, holders, links, meteora, contract]
+  return [title, ath, signals, market, holders, links, meteora, contract]
     .filter((section) => section.length > 0)
     .map((section) => section.join('\n'))
     .join('\n\n');
@@ -317,7 +334,7 @@ export function formatRichBlock(v: RichTokenView): string {
  * an oversized alert never drops the whole message. Built from bounded fields only.
  */
 function minimalBlock(v: RichTokenView): string {
-  const emoji = v.kind === 'gmgn' ? VERDICT_EMOJI[v.verdict ?? 'PASS'] : v.kind === 'check' ? '🔍' : '🔻';
+  const emoji = blockEmoji(v);
   const dd = v.drawdownPct !== undefined ? ` down ${esc(fmtPct(v.drawdownPct))}% from ATH` : '';
   return `${emoji} \`${esc(v.mint)}\`${dd}`;
 }
@@ -329,6 +346,9 @@ function headerFor(kind: RichAlertKind, count: number): string {
   }
   if (kind === 'check') {
     return count === 1 ? '🔍 *Token Check*' : `🔍 *Token Check* \\(${count}\\)`;
+  }
+  if (kind === 'zap') {
+    return count === 1 ? '⚡ *Zap In Reminder*' : `⚡ *Zap In Reminders* \\(${count}\\)`;
   }
   return count === 1 ? '🔻 *ATH Drawdown Alert*' : `🔻 *ATH Drawdown Alerts* \\(${count}\\)`;
 }

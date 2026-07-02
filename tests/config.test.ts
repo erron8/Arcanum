@@ -1,11 +1,10 @@
 import { test, expect, describe } from 'bun:test';
 import { buildConfig, validateEnv } from '../src/alerts/config';
 
-// Helper: a "valid config" needs a bot token, the fail-closed auth satisfied, and a
-// GMGN key (the scanner always requires one). Provide all three so each test can focus
-// on the single field it's exercising.
+// Helper: a "valid config" needs a bot token and the fail-closed auth satisfied.
+// A GMGN key is optional unless scanner behavior is being tested.
 const ok = (env: Record<string, string | undefined> = {}): string[] =>
-  validateEnv({ TELEGRAM_BOT_TOKEN: 't', ALLOW_OPEN_BOT: 'true', GMGN_API_KEY: 'k', ...env });
+  validateEnv({ TELEGRAM_BOT_TOKEN: 't', ALLOW_OPEN_BOT: 'true', ...env });
 
 describe('validateEnv', () => {
   test('clean env yields no errors', () => {
@@ -26,7 +25,7 @@ describe('validateEnv', () => {
   test('fails closed when neither allowlist nor ALLOW_OPEN_BOT is set', () => {
     const errs = validateEnv({});
     expect(errs.some((e) => e.includes('ALLOW_OPEN_BOT'))).toBe(true);
-    const base = { TELEGRAM_BOT_TOKEN: 't', GMGN_API_KEY: 'k' };
+    const base = { TELEGRAM_BOT_TOKEN: 't' };
     // An allowlist alone satisfies auth…
     expect(validateEnv({ ...base, TELEGRAM_ALLOWED_CHAT_IDS: '123' })).toEqual([]);
     // …and so does the explicit open-mode opt-in.
@@ -167,6 +166,7 @@ describe('buildConfig', () => {
 
   test('GMGN scanner has sane defaults', () => {
     const g = buildConfig({}).gmgn;
+    expect(g.enabled).toBe(false);
     expect(g.autoWatch).toBe(false);
     expect(g.apiKey).toBe('');
     expect(g.scanIntervalMs).toBe(300_000);
@@ -184,75 +184,133 @@ describe('buildConfig', () => {
   });
 
   test('GMGN flags parse from env', () => {
-    const g = buildConfig({ GMGN_AUTO_WATCH: 'true', GMGN_API_KEY: ' k ' }).gmgn;
-    expect(g.autoWatch).toBe(true);
+    const g = buildConfig({ GMGN_SCANNER_ENABLED: 'true', GMGN_AUTO_WATCH: 'true', GMGN_API_KEY: ' k ' }).gmgn;
+    expect(g.enabled).toBe(true);
+    expect(g.autoWatch).toBe(false);
     expect(g.apiKey).toBe('k'); // trimmed
+  });
+
+  test('Zap scanner has sane defaults', () => {
+    const z = buildConfig({}).zap;
+    expect(z.enabled).toBe(false);
+    expect(z.scanIntervalMs).toBe(300_000);
+    expect(z.marketCapMinUsd).toBe(250_000);
+    expect(z.maxTokenAgeHours).toBe(48);
+    expect(z.athTolerancePct).toBe(3);
+    expect(z.volumeMin5mUsd).toBe(25_000);
+    expect(z.supertrendPeriod).toBe(10);
+    expect(z.supertrendMultiplier).toBe(3);
+    expect(z.scanLimit).toBe(100);
+    expect(z.scanConcurrency).toBe(4);
+    expect(z.dedupeMs).toBe(86_400_000);
+    expect(z.screenedPath).toBe('./data/zap-screened.json');
+  });
+
+  test('Zap flags/tunables parse from env', () => {
+    const z = buildConfig({
+      ZAP_SCANNER_ENABLED: 'true',
+      ZAP_VOLUME_MIN_5M_USD: '40000',
+      ZAP_MAX_TOKEN_AGE_HOURS: '24',
+    }).zap;
+    expect(z.enabled).toBe(true);
+    expect(z.volumeMin5mUsd).toBe(40_000);
+    expect(z.maxTokenAgeHours).toBe(24);
   });
 });
 
 describe('validateEnv GMGN', () => {
-  test('a valid config with a GMGN key passes', () => {
+  test('a valid config without a GMGN key passes', () => {
     expect(ok()).toEqual([]);
   });
 
-  test('GMGN_API_KEY is always required (scanner is core)', () => {
+  test('GMGN_API_KEY is required only when automatic scanner is enabled', () => {
     const base = { TELEGRAM_BOT_TOKEN: 't', ALLOW_OPEN_BOT: 'true' };
-    // No key → error.
-    expect(validateEnv(base).some((e) => e.includes('GMGN_API_KEY'))).toBe(true);
-    // A real key → valid.
-    expect(validateEnv({ ...base, GMGN_API_KEY: 'secret' })).toEqual([]);
+    expect(validateEnv(base)).toEqual([]);
+    expect(validateEnv({ ...base, GMGN_SCANNER_ENABLED: 'true' }).some((e) => e.includes('GMGN_API_KEY'))).toBe(true);
+    expect(validateEnv({ ...base, GMGN_SCANNER_ENABLED: 'true', GMGN_API_KEY: 'secret' })).toEqual([]);
   });
 
   test('rejects the .env.example placeholder secrets', () => {
     const base = { ALLOW_OPEN_BOT: 'true' };
     expect(
-      validateEnv({ ...base, TELEGRAM_BOT_TOKEN: 'replace-with-your-botfather-token', GMGN_API_KEY: 'k' })
+      validateEnv({ ...base, TELEGRAM_BOT_TOKEN: 'replace-with-your-botfather-token' })
         .some((e) => e.includes('TELEGRAM_BOT_TOKEN')),
     ).toBe(true);
     expect(
-      validateEnv({ ...base, TELEGRAM_BOT_TOKEN: 't', GMGN_API_KEY: 'replace-with-your-gmgn-openapi-key' })
+      validateEnv({
+        ...base,
+        TELEGRAM_BOT_TOKEN: 't',
+        GMGN_SCANNER_ENABLED: 'true',
+        GMGN_API_KEY: 'replace-with-your-gmgn-openapi-key',
+      })
         .some((e) => e.includes('GMGN_API_KEY')),
     ).toBe(true);
     expect(
-      validateEnv({ ...base, TELEGRAM_BOT_TOKEN: 't', GMGN_API_KEY: 'your-gmgn-openapi-key' })
+      validateEnv({
+        ...base,
+        TELEGRAM_BOT_TOKEN: 't',
+        GMGN_SCANNER_ENABLED: 'true',
+        GMGN_API_KEY: 'your-gmgn-openapi-key',
+      })
         .some((e) => e.includes('GMGN_API_KEY')),
     ).toBe(true);
   });
 
   test('scan interval must be >= 60000', () => {
-    expect(ok({ GMGN_SCAN_INTERVAL_MS: '1000' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_SCAN_INTERVAL_MS: '60000' })).toEqual([]);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_INTERVAL_MS: '1000' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_INTERVAL_MS: '60000' })).toEqual([]);
   });
 
   test('concurrency must be in [1, 32]', () => {
-    expect(ok({ GMGN_SCAN_CONCURRENCY: '0' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_SCAN_CONCURRENCY: '64' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_SCAN_CONCURRENCY: '8' })).toEqual([]);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_CONCURRENCY: '0' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_CONCURRENCY: '64' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_CONCURRENCY: '8' })).toEqual([]);
   });
 
   test('scan limit must be in [1, 100]', () => {
-    expect(ok({ GMGN_SCAN_LIMIT: '0' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_SCAN_LIMIT: '101' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_SCAN_LIMIT: '50' })).toEqual([]);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_LIMIT: '0' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_LIMIT: '101' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_SCAN_LIMIT: '50' })).toEqual([]);
   });
 
   test('drawdown must be in [0, 100] and numerics finite', () => {
-    expect(ok({ GMGN_DRAWDOWN_MIN_PCT: '150' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_TOTAL_FEE_MIN_SOL: 'abc' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_MARKET_CAP_MIN_USD: '-1' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_DRAWDOWN_MIN_PCT: '150' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_TOTAL_FEE_MIN_SOL: 'abc' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_MARKET_CAP_MIN_USD: '-1' }).length).toBeGreaterThan(0);
   });
 
   test('GMGN rate-limit pacing knobs must be finite and non-negative', () => {
-    expect(ok({ GMGN_REQUEST_INTERVAL_MS: '-1' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_429_COOLDOWN_MS: '-1' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_REQUEST_INTERVAL_MS: '0', GMGN_429_COOLDOWN_MS: '0' })).toEqual([]);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_REQUEST_INTERVAL_MS: '-1' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_429_COOLDOWN_MS: '-1' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', GMGN_REQUEST_INTERVAL_MS: '0', GMGN_429_COOLDOWN_MS: '0' })).toEqual([]);
   });
 
   test('min age must be below max age', () => {
     expect(
-      ok({ GMGN_MIN_TOKEN_AGE_HOURS: '400', GMGN_MAX_TOKEN_AGE_DAYS: '14' }).some((e) =>
+      ok({ GMGN_API_KEY: 'k', GMGN_MIN_TOKEN_AGE_HOURS: '400', GMGN_MAX_TOKEN_AGE_DAYS: '14' }).some((e) =>
         e.includes('less than'),
       ),
     ).toBe(true);
+  });
+});
+
+describe('validateEnv Zap', () => {
+  test('GMGN_API_KEY is required only when ZAP_SCANNER_ENABLED=true', () => {
+    const base = { TELEGRAM_BOT_TOKEN: 't', ALLOW_OPEN_BOT: 'true' };
+    expect(validateEnv(base)).toEqual([]);
+    expect(
+      validateEnv({ ...base, ZAP_SCANNER_ENABLED: 'true' }).some((e) => e.includes('GMGN_API_KEY')),
+    ).toBe(true);
+    expect(validateEnv({ ...base, ZAP_SCANNER_ENABLED: 'true', GMGN_API_KEY: 'secret' })).toEqual([]);
+  });
+
+  test('zap tunables are validated once a real key is present', () => {
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_SCAN_INTERVAL_MS: '1000' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_ATH_TOLERANCE_PCT: '150' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_SUPERTREND_MULTIPLIER: '0' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_SUPERTREND_PERIOD: '1.5' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_SCAN_LIMIT: '101' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_SCAN_CONCURRENCY: '64' }).length).toBeGreaterThan(0);
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_VOLUME_MIN_5M_USD: '40000', ZAP_MAX_TOKEN_AGE_HOURS: '24' })).toEqual([]);
   });
 });

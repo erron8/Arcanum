@@ -1,8 +1,7 @@
 # 📜 Arcanum
 
-**📜 Arcanum** is a Telegram bot that **automatically and manually tracks drawdown from
-trending Solana memecoins** — coins that have fallen far below their all‑time high (ATH)
-but are still alive.
+**📜 Arcanum** is a Telegram bot that tracks drawdown from all‑time highs (ATH) for the
+Solana tokens you manually add to your watchlist.
 
 Built with **Bun** + **TypeScript** + **grammY**, powered by the **GMGN**, **Jupiter**,
 and **Meteora** APIs.
@@ -11,14 +10,17 @@ and **Meteora** APIs.
 
 ## What it does
 
-- 🔎 **Automatic scanning** — a built‑in scanner continuously sweeps **trending Solana
-  memecoins**, keeps the ones that are deep in drawdown but still active, screens them
-  for safety (renounce status, holder concentration, snipers, bundlers, wash‑trading,
-  smart‑money), and alerts you on the survivors. Runs on a timer and on demand via
-  `/scan`.
 - 🔍 **Manual tracking** — `/check <mint>` renders a full token card for **any** coin
   instantly; `/watch <mint>` follows a token and pings you the moment it crosses your
   drawdown threshold.
+- 🔎 **Optional GMGN screening** — `/scan` runs one GMGN screening cycle on demand. Set
+  `GMGN_SCANNER_ENABLED=true` only if you want the timer. Scanner candidates are not
+  added to `/watch`.
+- ⚡ **Optional Zap In reminders** — `/zap` finds tokens at a **fresh ATH** with bullish
+  momentum (mcap ≥ 250K, a hot recent 5m candle, a bullish 15m Supertrend, age < 2 days,
+  and no security red flags) and pings you a separate `Zap In Reminder`. Set
+  `ZAP_SCANNER_ENABLED=true` for the timer. Like the screener, its candidates are not
+  added to `/watch`.
 - 📊 **Rich cards** — every alert and card shows market cap (now ⇨ ATH), drawdown,
   liquidity, 24h volume, top holders, smart‑money/KOL activity, socials, and the token's
   **Meteora DLMM pools** — with the name linked to **GMGN**.
@@ -64,8 +66,8 @@ cashtag — tap it to search the chat for that token.
 
 - [Bun](https://bun.sh)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- A **GMGN OpenAPI key** — required; it powers the trending‑memecoin scanning and the
-  rich token data on every card. Get one at
+- A **GMGN OpenAPI key** — optional; it powers richer token data and the optional
+  GMGN scanner. Get one at
   [gmgn.ai → API Management](https://gmgn.ai/ai?chain=sol&tab=api_management) → **Create
   API Key**.
 
@@ -81,6 +83,7 @@ Edit `.env` and set at least:
 ```env
 TELEGRAM_BOT_TOKEN=your-botfather-token
 TELEGRAM_ALLOWED_CHAT_IDS=123456789      # your Telegram chat/user id(s), comma-separated
+# optional:
 GMGN_API_KEY=your-gmgn-openapi-key
 ```
 
@@ -93,11 +96,8 @@ Run it:
 bun run start
 ```
 
-The scanner starts sweeping trending memecoins immediately and then on a timer.
-
-> ⚠️ **Send `/start` to the bot first** (or set `TELEGRAM_CHAT_ID` in `.env`). Automatic
-> scanner alerts are only delivered to chats that have subscribed — with no subscribers,
-> the scanner finds candidates but has nowhere to send them.
+Send `/start` to the bot first (or set `TELEGRAM_CHAT_ID` in `.env`) so watched-token
+alerts have a delivery target.
 
 To track a specific coin yourself, send **`/watch <token_mint>`** (alerts at 50% below
 ATH by default; set your own with `/watch <mint> 40`), or get a one‑off card with
@@ -122,17 +122,20 @@ To use the bot in a **group**, just invite it and have members run commands ther
 | `/resetath <mint>` | Reset a token's stored ATH and re‑arm its alert |
 | `/scan` | Run the trending‑memecoin drawdown scan right now |
 | `/gmgnstatus` | Summary of the last scan (counts, drop reasons, last alert, errors) |
-| `/testalert` | Preview what an alert looks like |
+| `/zap` | Scan now for Zap In (fresh‑ATH breakout) reminders |
+| `/zapstatus` | Summary of the last Zap In scan |
+| `/testalert` | Preview one of each alert (ATH drawdown, GMGN screening, Zap In) |
 | `/help` | List all commands |
 
 All commands also appear in Telegram's **Menu** button and `/` autocomplete.
 
 ---
 
-## How scanning works
+## Optional GMGN Scanning
 
-The scanner runs **automatically on a timer** (every 5 minutes by default) and **on
-demand** with `/scan`. Each pass:
+The scanner runs **on demand** with `/scan`. If you want automatic GMGN screening too,
+set `GMGN_SCANNER_ENABLED=true` and provide `GMGN_API_KEY`; the timer runs every
+5 minutes by default. Each pass:
 
 1. Pulls the current trending Solana memecoins from GMGN.
 2. Keeps only coins that are **deep in drawdown** (≥ 50% below ATH by default) **but
@@ -141,8 +144,11 @@ demand** with `/scan`. Each pass:
    concentration, acceptable snipers/bundlers, and no wash‑trading; smart‑money/KOL
    activity is shown when present. Clearly unsafe coins are dropped; borderline ones
    (including coins with no smart‑money signal) are flagged ⚠️ but still sent.
-4. Sends a card for each coin that passes (de‑duplicated so you aren't pinged twice for
-   the same coin within 24h).
+4. Sends a GMGN screening card for each coin that passes (de‑duplicated so you aren't
+   pinged twice for the same coin within 24h).
+
+Scanner candidates are never written to the manual watchlist. ATH Drawdown Alerts come
+only from tokens you add with `/watch <mint>`.
 
 Tune every threshold (drawdown %, min fees, market cap, token age, cadence, etc.) with
 the `GMGN_*` variables in [`.env.example`](./.env.example). `/gmgnstatus` shows what the
@@ -154,6 +160,28 @@ turn them off with `METEORA_LINKS_ENABLED=false`.
 
 ---
 
+## Optional Zap In Reminders
+
+The **inverse** of the drawdown scanner. It runs **on demand** with `/zap` (and on a
+timer when `ZAP_SCANNER_ENABLED=true`), sharing the same `GMGN_API_KEY`. Instead of coins
+deep in drawdown, it looks for coins that are **breaking out at a fresh ATH**. A coin is
+sent as a `Zap In Reminder` only when **all** of these hold:
+
+1. **New ATH above 250K mcap** — market cap ≥ `ZAP_MARKET_CAP_MIN_USD` and the current
+   price is at the ATH (within `ZAP_ATH_TOLERANCE_PCT`).
+2. **Good 5‑minute volume** — a recent 5m candle traded ≥ `ZAP_VOLUME_MIN_5M_USD`.
+3. **Bullish 15m Supertrend** — computed from 15m candles (`ZAP_SUPERTREND_PERIOD` /
+   `ZAP_SUPERTREND_MULTIPLIER`, default 10 / 3).
+4. **Just made that new ATH** — the ATH was touched within the recent 5m window, and the
+   token is **under 2 days old** (`ZAP_MAX_TOKEN_AGE_HOURS`).
+5. **Not obviously unsafe** — mint/freeze renounced, no honeypot, no wash trading.
+
+Everything is measured from the GMGN API. Zap In candidates are de‑duplicated (24h) and,
+like the drawdown scanner, are **never** written to the manual `/watch` watchlist.
+`/zapstatus` shows what the last Zap scan did.
+
+---
+
 ## Configuration
 
 The most common settings:
@@ -161,11 +189,15 @@ The most common settings:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | — | **Required.** Your BotFather token. |
-| `GMGN_API_KEY` | — | **Required.** Powers the scanner + card data. |
+| `GMGN_API_KEY` | — | Optional. Powers GMGN card data and `/scan`. |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | — | Allowed chat ids (keeps the bot private). |
-| `TELEGRAM_CHAT_ID` | — | Optional chat pre‑seeded to receive scanner alerts. |
+| `TELEGRAM_CHAT_ID` | — | Optional chat pre‑seeded to receive alerts. |
+| `GMGN_SCANNER_ENABLED` | false | Run the GMGN scanner on a timer. |
 | `GMGN_SCAN_INTERVAL_MS` | 300000 | How often the scanner runs (≥ 60000). |
 | `GMGN_DRAWDOWN_MIN_PCT` | 50 | Min % below ATH for the scanner to flag a coin. |
+| `ZAP_SCANNER_ENABLED` | false | Run the Zap In (fresh‑ATH) scanner on a timer. |
+| `ZAP_VOLUME_MIN_5M_USD` | 25000 | Min USD in a recent 5m candle for a Zap In reminder. |
+| `ZAP_MAX_TOKEN_AGE_HOURS` | 48 | Max token age for a Zap In reminder (< 2 days). |
 | `DEFAULT_DRAWDOWN_THRESHOLD_PCT` | 50 | Default `/watch` alert threshold. |
 | `POLL_INTERVAL_MS` | 60000 | How often watched tokens are checked. |
 | `QUOTE` | native | `native` (SOL) or `usd` for the `/watch` price/ATH. |
