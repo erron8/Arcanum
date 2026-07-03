@@ -185,7 +185,7 @@ async function main(): Promise<void> {
     console.log(
       `[index] Zap In scanner running · scanInterval=${config.zap.scanIntervalMs}ms · ` +
         `mcapMin=$${config.zap.marketCapMinUsd} · vol5mMin=$${config.zap.volumeMin5mUsd} · ` +
-        `maxAge=${config.zap.maxTokenAgeHours}h · supertrend=${config.zap.supertrendPeriod}/${config.zap.supertrendMultiplier}`,
+        `athTol=${config.zap.athTolerancePct}% · supertrend=${config.zap.supertrendPeriod}/${config.zap.supertrendMultiplier}`,
     );
     if (bot.subscriberIds().length === 0) {
       console.warn(

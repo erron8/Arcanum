@@ -17,8 +17,8 @@ and **Meteora** APIs.
   `GMGN_SCANNER_ENABLED=true` only if you want the timer. Scanner candidates are not
   added to `/watch`.
 - ⚡ **Optional Zap In reminders** — `/zap` finds tokens at a **fresh ATH** with bullish
-  momentum (mcap ≥ 250K, a hot recent 5m candle, a bullish 15m Supertrend, age < 2 days,
-  and no security red flags) and pings you a separate `Zap In Reminder`. Set
+  momentum (mcap ≥ 250K, a hot recent 5m candle, a bullish 15m Supertrend, and no security
+  red flags) and pings you a separate `Zap In Reminder`. Set
   `ZAP_SCANNER_ENABLED=true` for the timer. Like the screener, its candidates are not
   added to `/watch`.
 - 📊 **Rich cards** — every alert and card shows market cap (now ⇨ ATH), drawdown,
@@ -67,12 +67,12 @@ cashtag — tap it to search the chat for that token.
 - [Bun](https://bun.sh)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - A **GMGN OpenAPI key** — optional; it powers richer token data and the optional
-  GMGN scanner. Get one at
+  GMGN drawdown scanner and Zap In scanner. Get one at
   [gmgn.ai → API Management](https://gmgn.ai/ai?chain=sol&tab=api_management) → **Create
   API Key**.
 
 ```bash
-git clone https://github.com/erron8/Arcanum.git
+git clone https://github.com/<your-username>/Arcanum.git
 cd Arcanum
 bun install
 cp .env.example .env
@@ -172,13 +172,16 @@ sent as a `Zap In Reminder` only when **all** of these hold:
 2. **Good 5‑minute volume** — a recent 5m candle traded ≥ `ZAP_VOLUME_MIN_5M_USD`.
 3. **Bullish 15m Supertrend** — computed from 15m candles (`ZAP_SUPERTREND_PERIOD` /
    `ZAP_SUPERTREND_MULTIPLIER`, default 10 / 3).
-4. **Just made that new ATH** — the ATH was touched within the recent 5m window, and the
-   token is **under 2 days old** (`ZAP_MAX_TOKEN_AGE_HOURS`).
-5. **Not obviously unsafe** — mint/freeze renounced, no honeypot, no wash trading.
+4. **Just made that new ATH** — the ATH was touched within the recent 5m window.
+5. **Not obviously unsafe** — mint/freeze renounced, no honeypot, no wash trading. (High
+   snipers / holder concentration are shown as warnings, not blocks.)
 
-Everything is measured from the GMGN API. Zap In candidates are de‑duplicated (24h) and,
-like the drawdown scanner, are **never** written to the manual `/watch` watchlist.
-`/zapstatus` shows what the last Zap scan did.
+Everything is measured from the GMGN API. Token age is shown on the card but is **not** a
+filter. Zap In candidates are de‑duplicated (24h) and, like the drawdown scanner, are
+**never** written to the manual `/watch` watchlist. `/zapstatus` shows what the last Zap
+scan did, and `bun run zap:dryrun` runs one Zap cycle to the console without sending
+anything. Tune every threshold with the `ZAP_*` variables in
+[`.env.example`](./.env.example).
 
 ---
 
@@ -197,7 +200,7 @@ The most common settings:
 | `GMGN_DRAWDOWN_MIN_PCT` | 50 | Min % below ATH for the scanner to flag a coin. |
 | `ZAP_SCANNER_ENABLED` | false | Run the Zap In (fresh‑ATH) scanner on a timer. |
 | `ZAP_VOLUME_MIN_5M_USD` | 25000 | Min USD in a recent 5m candle for a Zap In reminder. |
-| `ZAP_MAX_TOKEN_AGE_HOURS` | 48 | Max token age for a Zap In reminder (< 2 days). |
+| `ZAP_ATH_TOLERANCE_PCT` | 15 | Max % below ATH to still count as "at a new ATH". |
 | `DEFAULT_DRAWDOWN_THRESHOLD_PCT` | 50 | Default `/watch` alert threshold. |
 | `POLL_INTERVAL_MS` | 60000 | How often watched tokens are checked. |
 | `QUOTE` | native | `native` (SOL) or `usd` for the `/watch` price/ATH. |
@@ -229,10 +232,12 @@ and fetch tuning.
 bun run start        # run the bot (long polling, or webhook if WEBHOOK_URL is set)
 bun test             # run the test suite
 bun run typecheck    # strict TypeScript check
-bun run gmgn:dryrun  # run one scanner cycle and print results (no Telegram, needs GMGN_API_KEY)
+bun run gmgn:dryrun  # run one GMGN drawdown scan and print results (no Telegram, needs GMGN_API_KEY)
+bun run zap:dryrun   # run one Zap In scan and print results (no Telegram, needs GMGN_API_KEY)
 ```
 
-State is stored as JSON under `data/` (watchlist, subscribers, scanner dedupe).
+State is stored as JSON under `data/` (watchlist, subscribers, and the GMGN + Zap
+scanner dedupe stores).
 
 ---
 

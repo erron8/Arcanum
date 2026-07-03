@@ -105,7 +105,6 @@ export interface ZapConfig {
   enabled: boolean;
   scanIntervalMs: number;
   marketCapMinUsd: number;
-  maxTokenAgeHours: number;
   /** Max % below ATH the current price (and recent high) may sit and still count as "at a new ATH". */
   athTolerancePct: number;
   /** Min USD volume in the single hottest recent 5-minute candle. */
@@ -191,8 +190,7 @@ function buildZapConfig(env: Env): ZapConfig {
     enabled: rawBool(env, 'ZAP_SCANNER_ENABLED', false),
     scanIntervalMs: rawNum(env, 'ZAP_SCAN_INTERVAL_MS', 300_000),
     marketCapMinUsd: rawNum(env, 'ZAP_MARKET_CAP_MIN_USD', 250_000),
-    maxTokenAgeHours: rawNum(env, 'ZAP_MAX_TOKEN_AGE_HOURS', 48),
-    athTolerancePct: rawNum(env, 'ZAP_ATH_TOLERANCE_PCT', 3),
+    athTolerancePct: rawNum(env, 'ZAP_ATH_TOLERANCE_PCT', 15),
     volumeMin5mUsd: rawNum(env, 'ZAP_VOLUME_MIN_5M_USD', 25_000),
     supertrendPeriod: rawNum(env, 'ZAP_SUPERTREND_PERIOD', 10),
     supertrendMultiplier: rawNum(env, 'ZAP_SUPERTREND_MULTIPLIER', 3),
@@ -515,8 +513,7 @@ function validateZapEnv(
 
   v.requirePositive('ZAP_SCAN_INTERVAL_MS', 300_000, 60_000);
   v.requirePositive('ZAP_MARKET_CAP_MIN_USD', 250_000, 0);
-  v.requireRange('ZAP_MAX_TOKEN_AGE_HOURS', 48, 0, 24 * 365);
-  v.requireRange('ZAP_ATH_TOLERANCE_PCT', 3, 0, 100);
+  v.requireRange('ZAP_ATH_TOLERANCE_PCT', 15, 0, 100);
   v.requirePositive('ZAP_VOLUME_MIN_5M_USD', 25_000, 0);
   v.requireInt('ZAP_SUPERTREND_PERIOD', 10, 1);
   v.requireRange('ZAP_SUPERTREND_MULTIPLIER', 3, 0, 100);

@@ -8,6 +8,7 @@ import {
   screenSecurity,
   summarizeReasons,
   type GmgnNotifier,
+  type SecurityResult,
 } from './scanner';
 import { computeSupertrend } from './indicators';
 import { formatRichMessages } from '../alerts/richFormat';
@@ -17,6 +18,8 @@ import type { GmgnKlineCandle, GmgnRankItem, GmgnTokenInfo } from './types';
 
 const CHAIN = 'sol';
 const HOUR_MS = 3_600_000;
+/** Bound on the ATH-fallback hourly kline lookback (days) so the request stays bounded. */
+const ATH_FALLBACK_LOOKBACK_DAYS = 14;
 
 /** Final, deliverable "zap in" candidate for one token. */
 export interface ZapCandidate {
@@ -56,6 +59,34 @@ export function quickFilterZapRank(
 
 // --- volume helper ---------------------------------------------------------
 
+// --- security (zap-specific severity) --------------------------------------
+
+/**
+ * Security reasons that `screenSecurity` treats as hard blocks but the Zap path
+ * downgrades to warnings. A *fresh-ATH token under 2 days old* routinely has high
+ * holder concentration and many snipers — blocking on those would suppress every zap
+ * alert. The genuinely dangerous checks (honeypot / unrenounced mint+freeze / wash
+ * trading / rug ratio / creator-hold / bundler dominance) stay hard blocks.
+ */
+const ZAP_SOFT_SECURITY_PREFIXES = ['top_10_holder_rate', 'sniper_count'];
+
+/**
+ * Split the security screen into what still blocks a zap alert vs. what is merely a
+ * warning shown on the card. Pure so it is unit-testable.
+ */
+export function partitionZapSecurity(sec: SecurityResult): {
+  blocking: string[];
+  warnings: string[];
+} {
+  const blocking: string[] = [];
+  const softened: string[] = [];
+  for (const f of sec.hardFails) {
+    if (ZAP_SOFT_SECURITY_PREFIXES.some((p) => f.startsWith(p))) softened.push(f);
+    else blocking.push(f);
+  }
+  return { blocking, warnings: [...sec.warnings, ...softened] };
+}
+
 /** Largest single-candle USD volume across the given candles (0 if none/invalid). */
 export function max5mVolume(candles: GmgnKlineCandle[]): number {
   let max = 0;
@@ -79,14 +110,14 @@ export interface ZapBaseResult {
 }
 
 /**
- * Apply the info-derivable Zap gates: market cap floor, token age ceiling, and
- * "at a new ATH" (current price within `athTolerancePct` of the ATH). Fails closed on
- * a missing/zero price or an unknown ATH — an entry reminder must not fire on bad data.
- * Volume, Supertrend, and the security safety gate are checked separately by the scanner.
+ * Apply the info-derivable Zap gates: market cap floor and "at a new ATH" (current price
+ * within `athTolerancePct` of the ATH). Fails closed on a missing/zero price or an unknown
+ * ATH — an entry reminder must not fire on bad data. Token age is computed for display but
+ * is NOT a gate. Volume, Supertrend, and the security safety gate are checked by the scanner.
  */
 export function zapBaseFilter(
   info: GmgnTokenInfo,
-  cfg: Pick<ZapConfig, 'marketCapMinUsd' | 'maxTokenAgeHours' | 'athTolerancePct'>,
+  cfg: Pick<ZapConfig, 'marketCapMinUsd' | 'athTolerancePct'>,
   opts: { nowMs?: number; klineAth?: number; fallbackMarketCap?: number } = {},
 ): ZapBaseResult {
   const nowMs = opts.nowMs ?? Date.now();
@@ -111,18 +142,11 @@ export function zapBaseFilter(
     reasons.push(`market_cap ${Math.round(marketCap)} < ${cfg.marketCapMinUsd} USD`);
   }
 
-  // Token age: prefer open_timestamp, else creation_timestamp (Unix seconds). Must be
-  // known and at or under the ceiling ("under 2 days"). No lower bound.
+  // Token age is informational only — there is no age gate. Compute it (open_timestamp,
+  // else creation_timestamp; Unix seconds) for the alert card when it is available.
   const openedAt = toNum(info.open_timestamp) ?? toNum(info.creation_timestamp);
-  let ageHours = 0;
-  if (openedAt !== undefined && openedAt > 0) {
-    ageHours = (nowMs - openedAt * 1000) / HOUR_MS;
-    if (ageHours > cfg.maxTokenAgeHours) {
-      reasons.push(`age ${ageHours.toFixed(1)}h > ${cfg.maxTokenAgeHours}h`);
-    }
-  } else {
-    reasons.push('token age unknown (no open/creation timestamp)');
-  }
+  const ageHours =
+    openedAt !== undefined && openedAt > 0 ? (nowMs - openedAt * 1000) / HOUR_MS : 0;
 
   // ATH: prefer info.ath_price, fall back to the kline-derived high. If the current
   // price prints a new high above the stored ATH, treat the current price as the ATH.
@@ -463,10 +487,12 @@ export class ZapScanner {
       }
 
       // Safety gate: block honeypot / unrenounced / wash trading before an entry alert.
+      // Snipers / holder concentration are downgraded to warnings for the zap path
+      // (see partitionZapSecurity) since young fresh-ATH tokens almost always trip them.
       const security = await this.deps.client.getTokenSecurity(CHAIN, mint);
-      const sec = screenSecurity(security);
-      if (sec.hardFails.length > 0) {
-        this.dropReasons.push(`unsafe (${sec.hardFails[0]})`);
+      const zapSec = partitionZapSecurity(screenSecurity(security));
+      if (zapSec.blocking.length > 0) {
+        this.dropReasons.push(`unsafe (${zapSec.blocking[0]})`);
         return null;
       }
 
@@ -497,9 +523,9 @@ export class ZapScanner {
         `Fresh ATH · mcap ${compactUsd(base.marketCap)}`,
         `5m volume ${compactUsd(vol5mUsd)} ≥ ${compactUsd(this.cfg.volumeMin5mUsd)}`,
         `15m Supertrend bullish (${this.cfg.supertrendPeriod}/${this.cfg.supertrendMultiplier})`,
-        `Age ${ageLabel(base.ageHours)} (< ${ageLabel(this.cfg.maxTokenAgeHours)})`,
       ];
-      if (sec.warnings.length > 0) signals.push(`Note: ${sec.warnings[0]}`);
+      if (base.ageHours > 0) signals.push(`Age ${ageLabel(base.ageHours)}`);
+      if (zapSec.warnings.length > 0) signals.push(`Note: ${zapSec.warnings[0]}`);
 
       const view: RichTokenView = {
         ...display,
@@ -509,7 +535,7 @@ export class ZapScanner {
         name: info.name ?? item.name,
         chain: 'Solana',
         signals,
-        warnings: sec.warnings.length > 0 ? sec.warnings : undefined,
+        warnings: zapSec.warnings.length > 0 ? zapSec.warnings : undefined,
       };
 
       return {
@@ -548,7 +574,7 @@ export class ZapScanner {
 
   /**
    * Full-lifetime hourly kline for the ATH fallback: from the token's launch to now,
-   * clamped to at most `maxTokenAgeHours` so the range is always bounded.
+   * clamped to at most `ATH_FALLBACK_LOOKBACK_DAYS` so the range is always bounded.
    */
   private fetchAthKline(
     mint: string,
@@ -556,7 +582,7 @@ export class ZapScanner {
     nowMs: number,
   ): Promise<GmgnKlineCandle[]> {
     const toSec = Math.floor(nowMs / 1000);
-    const earliest = toSec - this.cfg.maxTokenAgeHours * 3600;
+    const earliest = toSec - ATH_FALLBACK_LOOKBACK_DAYS * 24 * 3600;
     const launch = toNum(info.open_timestamp) ?? toNum(info.creation_timestamp);
     const fromSec = launch !== undefined && launch > earliest ? Math.floor(launch) : earliest;
     return this.deps.client.getKline(CHAIN, mint, '1h', fromSec, toSec);

@@ -195,8 +195,7 @@ describe('buildConfig', () => {
     expect(z.enabled).toBe(false);
     expect(z.scanIntervalMs).toBe(300_000);
     expect(z.marketCapMinUsd).toBe(250_000);
-    expect(z.maxTokenAgeHours).toBe(48);
-    expect(z.athTolerancePct).toBe(3);
+    expect(z.athTolerancePct).toBe(15);
     expect(z.volumeMin5mUsd).toBe(25_000);
     expect(z.supertrendPeriod).toBe(10);
     expect(z.supertrendMultiplier).toBe(3);
@@ -210,11 +209,11 @@ describe('buildConfig', () => {
     const z = buildConfig({
       ZAP_SCANNER_ENABLED: 'true',
       ZAP_VOLUME_MIN_5M_USD: '40000',
-      ZAP_MAX_TOKEN_AGE_HOURS: '24',
+      ZAP_ATH_TOLERANCE_PCT: '10',
     }).zap;
     expect(z.enabled).toBe(true);
     expect(z.volumeMin5mUsd).toBe(40_000);
-    expect(z.maxTokenAgeHours).toBe(24);
+    expect(z.athTolerancePct).toBe(10);
   });
 });
 
@@ -311,6 +310,6 @@ describe('validateEnv Zap', () => {
     expect(ok({ GMGN_API_KEY: 'k', ZAP_SUPERTREND_PERIOD: '1.5' }).length).toBeGreaterThan(0);
     expect(ok({ GMGN_API_KEY: 'k', ZAP_SCAN_LIMIT: '101' }).length).toBeGreaterThan(0);
     expect(ok({ GMGN_API_KEY: 'k', ZAP_SCAN_CONCURRENCY: '64' }).length).toBeGreaterThan(0);
-    expect(ok({ GMGN_API_KEY: 'k', ZAP_VOLUME_MIN_5M_USD: '40000', ZAP_MAX_TOKEN_AGE_HOURS: '24' })).toEqual([]);
+    expect(ok({ GMGN_API_KEY: 'k', ZAP_VOLUME_MIN_5M_USD: '40000', ZAP_ATH_TOLERANCE_PCT: '10' })).toEqual([]);
   });
 });

@@ -65,10 +65,19 @@ export function computeSupertrend(
   period = 10,
   multiplier = 3,
 ): SupertrendResult | null {
+  // Supertrend's band carry-over is order-sensitive, so the candles MUST be
+  // chronological (oldest → newest). GMGN may return either direction; sort a copy by
+  // candle time whenever every candle carries a usable timestamp, otherwise trust the
+  // given order. Without this, a newest-first payload reads the trend off the wrong end.
+  let ordered = candles;
+  if (candles.length > 1 && candles.every((c) => toNum(c.time) !== undefined)) {
+    ordered = [...candles].sort((a, b) => toNum(a.time)! - toNum(b.time)!);
+  }
+
   const highs: number[] = [];
   const lows: number[] = [];
   const closes: number[] = [];
-  for (const c of candles) {
+  for (const c of ordered) {
     const h = toNum(c.high);
     const l = toNum(c.low);
     const cl = toNum(c.close);

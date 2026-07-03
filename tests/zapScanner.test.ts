@@ -10,7 +10,9 @@ import {
   quickFilterZapRank,
   zapBaseFilter,
   max5mVolume,
+  partitionZapSecurity,
 } from '../src/gmgn/zapScanner';
+import { screenSecurity } from '../src/gmgn/scanner';
 import { computeSupertrend } from '../src/gmgn/indicators';
 import { buildConfig } from '../src/alerts/config';
 import type { ZapConfig } from '../src/alerts/config';
@@ -49,7 +51,7 @@ describe('max5mVolume', () => {
 
 // --- pure: base filter -----------------------------------------------------
 describe('zapBaseFilter', () => {
-  const cfg = { marketCapMinUsd: 250_000, maxTokenAgeHours: 48, athTolerancePct: 3 };
+  const cfg = { marketCapMinUsd: 250_000, athTolerancePct: 3 };
 
   const atAth: GmgnTokenInfo = {
     market_cap: 500_000,
@@ -58,7 +60,7 @@ describe('zapBaseFilter', () => {
     open_timestamp: openedAt,
   };
 
-  test('passes at a fresh ATH with mcap + age within bounds', () => {
+  test('passes at a fresh ATH with mcap within bounds', () => {
     const r = zapBaseFilter(atAth, cfg, { nowMs: NOW });
     expect(r.pass).toBe(true);
     expect(r.drawdownPct).toBeCloseTo(0, 5);
@@ -75,9 +77,21 @@ describe('zapBaseFilter', () => {
     expect(zapBaseFilter({ ...atAth, market_cap: 100_000 }, cfg, { nowMs: NOW }).pass).toBe(false);
   });
 
-  test('fails when older than the age ceiling', () => {
-    const old = Math.floor((NOW - 3 * 24 * HOUR) / 1000); // 3 days
-    expect(zapBaseFilter({ ...atAth, open_timestamp: old }, cfg, { nowMs: NOW }).pass).toBe(false);
+  test('is age-agnostic: an old token still passes (no age gate)', () => {
+    const old = Math.floor((NOW - 30 * 24 * HOUR) / 1000); // 30 days
+    const r = zapBaseFilter({ ...atAth, open_timestamp: old }, cfg, { nowMs: NOW });
+    expect(r.pass).toBe(true);
+    expect(r.ageHours).toBeCloseTo(30 * 24, 0);
+  });
+
+  test('passes even when the token age is unknown (no timestamp)', () => {
+    const r = zapBaseFilter(
+      { ...atAth, open_timestamp: undefined, creation_timestamp: undefined },
+      cfg,
+      { nowMs: NOW },
+    );
+    expect(r.pass).toBe(true);
+    expect(r.ageHours).toBe(0);
   });
 
   test('treats a new high above the stored ATH as the ATH (drawdown 0, not negative)', () => {
@@ -133,6 +147,39 @@ describe('computeSupertrend', () => {
   test('skips malformed candles rather than throwing', () => {
     const withGap: GmgnKlineCandle[] = [...rising(20), { close: 'x' } as GmgnKlineCandle];
     expect(computeSupertrend(withGap, 10, 3)?.bullish).toBe(true);
+  });
+
+  test('reads the trend correctly even when candles arrive newest-first', () => {
+    const asc: GmgnKlineCandle[] = Array.from({ length: 20 }, (_, i) => {
+      const c = 1.0 + i * 0.05;
+      return { time: 1000 + i, open: c - 0.02, close: c, high: c + 0.02, low: c - 0.03, volume: 1000 };
+    });
+    const desc = [...asc].reverse(); // simulate a newest-first GMGN payload
+    expect(computeSupertrend(desc, 10, 3)?.bullish).toBe(true);
+    expect(computeSupertrend(asc, 10, 3)?.bullish).toBe(true); // same as already-sorted
+  });
+});
+
+// --- pure: zap security severity -------------------------------------------
+describe('partitionZapSecurity', () => {
+  test('downgrades snipers / holder concentration to warnings (not blocks)', () => {
+    const p = partitionZapSecurity(
+      screenSecurity({
+        renounced_mint: 1,
+        renounced_freeze_account: 1,
+        sniper_count: 25,
+        top_10_holder_rate: 0.6,
+      }),
+    );
+    expect(p.blocking).toEqual([]);
+    expect(p.warnings.some((w) => w.includes('sniper_count'))).toBe(true);
+    expect(p.warnings.some((w) => w.includes('top_10_holder_rate'))).toBe(true);
+  });
+
+  test('keeps genuinely dangerous checks as hard blocks', () => {
+    const p = partitionZapSecurity(screenSecurity({ rug_ratio: 0.9 }));
+    expect(p.blocking.some((b) => b.includes('rug_ratio'))).toBe(true);
+    expect(p.blocking.some((b) => b.includes('mint authority'))).toBe(true); // unrenounced
   });
 });
 
@@ -306,6 +353,23 @@ describe('ZapScanner.scanOnce', () => {
     });
     expect((await scanner.scanOnce()).length).toBe(0);
     expect(notified).toBe(false);
+  });
+
+  test('does not block on high snipers / holder concentration (warns instead)', async () => {
+    const store = await newStore();
+    let notified = false;
+    const scanner = new ZapScanner(zcfg(), {
+      client: makeClient(routes({ security: { ...cleanSecurity, sniper_count: 25, top_10_holder_rate: 0.6 } })),
+      store,
+      notify: async () => {
+        notified = true;
+        return true;
+      },
+      now: () => NOW,
+    });
+    const r = await scanner.scanOnce();
+    expect(r.length).toBe(1);
+    expect(notified).toBe(true);
   });
 
   test('drops a token that is not at a new ATH', async () => {

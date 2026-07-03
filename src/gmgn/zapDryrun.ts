@@ -52,8 +52,7 @@ async function main(): Promise<void> {
   console.log(
     `[zap-dryrun] config: scanLimit=${cfg.scanLimit} concurrency=${cfg.scanConcurrency} ` +
       `mcapMin=${cfg.marketCapMinUsd} athTol=${cfg.athTolerancePct}% ` +
-      `vol5mMin=${cfg.volumeMin5mUsd} supertrend=${cfg.supertrendPeriod}/${cfg.supertrendMultiplier} ` +
-      `maxAge=${cfg.maxTokenAgeHours}h`,
+      `vol5mMin=${cfg.volumeMin5mUsd} supertrend=${cfg.supertrendPeriod}/${cfg.supertrendMultiplier}`,
   );
 
   const client = new GmgnClient({

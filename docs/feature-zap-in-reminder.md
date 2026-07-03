@@ -44,10 +44,12 @@ Trigger criteria (ALL must hold; all measured from the GMGN API):
 3. **Bullish 15m Supertrend** — Supertrend over 15m candles with ATR period
    `ZAP_SUPERTREND_PERIOD` (10) and multiplier `ZAP_SUPERTREND_MULTIPLIER` (3) is in an
    up-trend at the latest bar.
-4. **Just made a new ATH, token age < 2 days** — the ATH was touched within the recent 5m
-   window, and the token is at most `ZAP_MAX_TOKEN_AGE_HOURS` (48h) old.
+4. **Just made a new ATH** — the ATH was touched within the recent 5m window. (Token age is
+   shown on the card but is NOT a gate — the max-age filter was removed.)
 5. **Safety gate** — the security screen must have no hard-fail (no honeypot, mint+freeze
-   renounced, no wash trading). Applied because a "zap in" is an actionable buy signal.
+   renounced, no wash trading, no rug/creator-hold/bundler dominance). High snipers and
+   holder concentration are downgraded to warnings for the zap path. Applied because a
+   "zap in" is an actionable buy signal.
 
 State changes:
 - Reads/writes only its own dedupe store at `ZAP_SCREENED_PATH`

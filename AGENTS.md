@@ -76,8 +76,9 @@ Zap In:
 - `/zap` is available only when a real `GMGN_API_KEY` is configured (shares the client).
 - Gates: mcap ≥ `ZAP_MARKET_CAP_MIN_USD`, at a fresh ATH within `ZAP_ATH_TOLERANCE_PCT`,
   a recent 5m candle ≥ `ZAP_VOLUME_MIN_5M_USD`, a bullish 15m Supertrend
-  (`ZAP_SUPERTREND_PERIOD`/`ZAP_SUPERTREND_MULTIPLIER`), token age ≤
-  `ZAP_MAX_TOKEN_AGE_HOURS`, and no blocking security issue (honeypot/unrenounced/wash).
+  (`ZAP_SUPERTREND_PERIOD`/`ZAP_SUPERTREND_MULTIPLIER`), and no blocking security issue
+  (honeypot/unrenounced/wash). Token age is shown on the card but is NOT a gate. High
+  snipers / holder concentration are downgraded to warnings for the zap path.
 
 ## Commands
 
